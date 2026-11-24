@@ -725,7 +725,14 @@ async fn run_classification(
     let mut slot = state.slots.acquire().await;
     let outcome = tokio::task::spawn_blocking(move || {
         cortiq_engine::gpu::set_current_device(slot.device);
-        let logits = slot.pipe.prefill_next_logits(&prompt_ids, mask.as_ref());
+        // generation's batched prompt path; the per-position walk if it declines
+        let logits = match slot.pipe.prompt_next_logits(&prompt_ids, mask.as_ref()) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("class-token scoring: {e}; walking the prompt per position");
+                slot.pipe.prefill_next_logits(&prompt_ids, mask.as_ref())
+            }
+        };
         let selected: Vec<f32> = labels.iter().map(|(_, id)| logits[*id as usize]).collect();
         let max = selected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let denom: f32 = selected.iter().map(|value| (*value - max).exp()).sum();

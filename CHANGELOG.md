@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.19] — 2026-11-24
+
+### Added
+- `skill bake --mask-scope linear`: the DTG-MA mask on the output rows of every projection — the GDN
+  in-projections and out_proj, q/k/v/o, gate, up and down — as the DTG-MA notebooks' DTGMALinear places it,
+  instead of on the FFN neurons (`ffn`, the default). The CUDA resident step scales each projection's output
+  by its gates and returns their gradient (the pre-gain output of o/out_proj and down is kept, the
+  in-projections' is the recomputed one divided back; the token sums run in a fixed order); the gates train
+  with the notebooks' AdamW and sparsity term (`--lin-l1`, λ times the mean over projections of their mean
+  gate) under `--through-attn`, the FFN neuron gates stay open. `skill export --gains-from` writes a
+  checkpoint as one f32 gain per output row (`.skillrowgain`), `skill apply` scales the base's rows and
+  re-encodes them in each tensor's codec. Qwen3.5-0.8B (399 936 gates over 186 projections, 1.704 MB), RTX
+  3060, 750 steps of 8 records, the 2000 dair-ai/emotion test texts through `serve` with the overlay: one-word
+  answer 89.2 → 90.6 %, JSON answer 90.6 → 91.3 % against the FFN-neuron mask (LoRA r=16 on every linear
+  layer, 43 MB: 91.6 / 92.0 %); 0.18–0.34 s a step. With every gate at 1 the step reproduces the base.
+
+### Changed
+- `skill bake` on CUDA, faster resident step (Qwen3.5-0.8B, `--mask-scope linear`, 32 JSON records a step,
+  RTX 3060: 1247 → 855 ms): the output masks ride in row-scaled weight copies made once a step instead of
+  scaling every projection's output and gradient (`bk_scale_rows`); the GDN forward runs on the NVG
+  trainer's kernel (`nt_gdn_fwd`, a state column over four threads in registers, 4.1 against 4.9 ms a layer);
+  the GDN chunk products of the backward take TF32 when Phase A is off strict f32 (`CMF_BAKE_A_STRICT=0`;
+  the NVG trainer keeps f32); `--length-buckets` pads a record to its length rounded up to 32 tokens
+  instead of a quarter-chunk bucket (87-token records went to 128). `CMF_BAKE_KT=<n>` times every kernel
+  of the n-th training step.
+- `skill export --gains-from CKPT.json`: a soft-folded skill (`skill bake --soft-fold --no-defrag`) stored as
+  its per-neuron gains — one f32 per FFN neuron of each changed `down_proj`, σ(logit) from the bake's
+  checkpoint, 0 for a closed neuron — instead of the folded tensors. The export rebuilds each changed down_proj
+  from the base and the gains (dequantize, scale the columns, re-encode in the layer's codec) and stores it as
+  gains only when the bytes equal the specialist's; any other changed tensor (a layer FCD trained) is stored
+  whole. `skill apply`, full or `--overlay`, rebuilds the gains the same way.
+  The Qwen3.5-0.8B market skills (`scripts/market-skill`): 0.378 MB instead of 88.4 MB, 24 of 24 `down_proj`
+  byte-identical, `apply --overlay` in 0.41 s, and the served predictions on the 480 held records identical
+  to the folded skill's (max |Δp| = 0).
+- `CMF_BAKE_RES_BF16=1`: the CUDA resident Phase-A step takes its weight products (the projections, the FFN
+  and their transposes) on bf16 operands with f32 accumulation — the precision torch's bf16 autocast trains a
+  LoRA in, at twice TF32's tensor rate on a GeForce card; the frozen weights get a bf16 copy on the card
+  beside the f32 ones, the activations are rounded on the way in, the attention products, the head and the
+  GDN gates stay as they were. Default off: Phase A keeps strict f32. Qwen3.5-0.8B market skill (`range`,
+  8 records of ~250 tokens a step, `--through-attn`), RTX 3060: 1.02 → 0.57 s a step (TF32 0.73), the
+  750-step bake 1043 → 622 s; the mask gradient off the f32 one by 3–10 % (worst layer), the best held
+  accuracy 68.75 % against 68.54 %. A LoRA r=16 on every linear layer with the same records and loss takes
+  0.62 s a step in torch.
+
+### Fixed
+- `skill bake` on CUDA no longer drops to the layer path for the rest of a bake when the resident step runs out
+  of card memory: the held evaluation's batch left its scratch and per-layer saves on the card, the next
+  training step's allocation failed (batch 64 on a 12 GB RTX 3060), and every later step ran ~10× slower on
+  the host path. The step now frees its scratch and saves — the frozen weights stay — and runs again on the
+  card; the layer path takes over only when that fails too.
+- The CUDA engine's lib tests compile again: `nvgt`'s GDN-core test called the bake's host entry
+  `bake_gdn_bwd`, a name the NVG device operator of the bake now shadows inside `nvgt`.
+- The NVG trainer's per-position GDN reverse kernel (`CMF_NVG_GDN_REV=kernel`, the reference of the chunked
+  sweep) launches on an RTX 3060: a launch bound keeps its registers within a block of 512 threads, where the
+  sm_86 build had failed with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
+
 ## [0.9.18] — 2026-11-24
 
 ### Added
@@ -85,6 +141,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `skill bake` on Vulkan: the GDN layers of a Qwen3.5-class model run the NVG trainer's f32 operator on the card
   (the backward replays it) instead of the host's f64 recurrence — the layer path's step with `--through-attn`
   5.3 → 1.7 s on Qwen3.5-0.8B, the same held-out PPL as CPU and CUDA.
+
+- `skill bake --focus-tokens` (the exact classifier) on the resident step: the head is the class rows only and
+  each target its class, the layer path's class-row softmax; it ran the layer path before (RTX 3060, Qwen3.5-0.8B,
+  8 records of ~240 tokens: 5.35 s a step). The resident step against the layer path (`CMF_BAKE_RES_CHECK=1`): the
+  loss to 1e-5, the mask gradient to 2.5e-5.
+- `skill bake` on CUDA: a GDN layer's backward runs the NVG trainer's operator (the states at chunk starts, the
+  reverse sweep as batched products over chunks) instead of the bake's per-position BPTT, which kept every state
+  of every position — 1.55 s of a 2.1 s step at 8 × ~280 tokens; the step 2.14 → 1.01 s. The states at chunk
+  starts are f16, so the mask gradient moves by 2.5e-4 against the layer path; `CMF_BAKE_GDN_NVG=0` keeps the
+  per-position kernel. `CMF_BAKE_RES_PROF=1` prints the CUDA step's sections too.
+- `serve`: `cortiq.class_tokens` scores through generation's own prompt path (the batched prefill, the device
+  graphs; `Pipeline::prompt_next_logits`) instead of walking the prompt a position at a time — Qwen3.5-0.8B on
+  CUDA, 231-token prompts: 1.4 → 23.6 requests/s, the same labels on 150 of 150 (probabilities within 0.024, the
+  q8 codec's prefill against its decode path).
 
 ### Fixed
 - wgpu, looped mHC stacks (SenseNova-Loop): on a card whose weight budget holds only part of the stack, the

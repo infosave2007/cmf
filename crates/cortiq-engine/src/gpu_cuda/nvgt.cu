@@ -602,7 +602,10 @@ extern "C" __global__ void nt_gdn_fwd(const float* cq, const float* z, const flo
 // the stored state before it advanced by the position itself. One state
 // array in registers either way, half the history's traffic. Three barriers
 // a position: the sums of a position are published a position early.
-extern "C" __global__ void nt_gdn_rev(const float* cq, const float* z, const float* a, const float* bb,
+// The launch bound caps the registers at what a block of DV·GC threads may
+// hold: without it sm_86's NVRTC build asked for more and the launch failed
+// (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES on an RTX 3060).
+extern "C" __global__ void __launch_bounds__(DV * GC) nt_gdn_rev(const float* cq, const float* z, const float* a, const float* bb,
                                       const float* a_log, const float* dt_bias, const float* normw, const float* dout,
                                       float* dcq, float* dz, float* da, float* db, float* dqk, const u16* hist,
                                       const float* kvh, const float* oh, int t, int nv, int nk, float eps, int seq0)

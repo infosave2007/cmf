@@ -494,6 +494,63 @@ extern "C" __global__ void bk_rmsnorm_bwd(const float* x, const float* w, const 
     }
 }
 
+// f32 -> bf16 over n values, rounded to nearest even (NaN kept quiet): the
+// activation operand of a bf16 weight GEMM in the resident step.
+extern "C" __global__ void bk_to_bf16(const float* __restrict__ x, unsigned short* __restrict__ y, long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned int u = __float_as_uint(x[i]);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        y[i] = (unsigned short)((u >> 16) | 0x40u);
+        return;
+    }
+    y[i] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+// The output masks of every Linear (`--mask-scope linear`, the DTG-MA notebooks' DTGMALinear).
+// A projection's weight [rows][cols] with each output row r scaled by g[r], once a step: the output masks
+// ride in the weights instead of on every output (y = (diag(g) W) x), f32 and bf16 copies.
+extern "C" __global__ void bk_scale_rows(const float* __restrict__ w, const float* __restrict__ g, float* __restrict__ y, int cols) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const long i = (long)blockIdx.y * cols + c;
+    y[i] = w[i] * g[blockIdx.y];
+}
+
+extern "C" __global__ void bk_scale_rows_bf16(const unsigned short* __restrict__ w, const float* __restrict__ g,
+                                              unsigned short* __restrict__ y, int cols) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const long i = (long)blockIdx.y * cols + c;
+    const unsigned int u = __float_as_uint(__uint_as_float((unsigned int)w[i] << 16) * g[blockIdx.y]);
+    y[i] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+// The gain gradient sum_r y[r][j] * dy[r][j] in two passes, in a fixed order (no atomics: a step stays
+// bit-reproducible): each block sums `rows` rows of 256 columns into part[chunk][j] ...
+extern "C" __global__ void bk_col_dot_part(const float* __restrict__ y, const float* __restrict__ dy, float* __restrict__ part,
+                                           long n, int m, int rows) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    const long r0 = (long)blockIdx.y * rows;
+    const long r1 = r0 + rows < n ? r0 + rows : n;
+    float s = 0.f;
+    for (long r = r0; r < r1; r++) s += y[r * m + j] * dy[r * m + j];
+    part[(long)blockIdx.y * m + j] = s;
+}
+
+// ... then the chunks in order into dg[j]; with `div` the y the parts summed was the gained output (y * g):
+// divided back by g to the projection's own output.
+extern "C" __global__ void bk_col_dot_sum(const float* __restrict__ part, const float* __restrict__ g, float* __restrict__ dg,
+                                          int chunks, int m, int div) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    float s = 0.f;
+    for (int c = 0; c < chunks; c++) s += part[(long)c * m + j];
+    if (div) s /= fmaxf(g[j], 1e-30f);
+    dg[j] += s;
+}
+
 // y = a + b (n elements)
 extern "C" __global__ void bk_add(const float* a, const float* b, float* y, long n) {
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

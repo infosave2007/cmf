@@ -169,7 +169,11 @@ fn build(c: &Ctx) -> Res<F> {
 struct Dev {
     c: &'static Ctx,
     f: F,
-    _g: std::sync::MutexGuard<'static, State>,
+    /// None: the caller already holds the context's lock (`bake_gdn_bwd`).
+    _g: Option<std::sync::MutexGuard<'static, State>>,
+    /// The GDN chunk products on TF32 (the skill bake off strict f32); the
+    /// trainer keeps them f32.
+    tf32: bool,
 }
 
 fn enter() -> Result<Dev, String> {
@@ -178,7 +182,7 @@ fn enter() -> Result<Dev, String> {
     c.current()?;
     let mut fg = FUNCS.lock().unwrap();
     let f = fg.get_or_insert_with(|| FBox(build(c))).0.clone()?;
-    Ok(Dev { c, f, _g: g })
+    Ok(Dev { c, f, _g: Some(g), tf32: false })
 }
 
 /// The card is up and the trainer's kernels compile on it.
@@ -422,7 +426,13 @@ impl Dev {
     #[allow(clippy::too_many_arguments)]
     unsafe fn mmb2(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, a: u64, lda: usize, sa: usize, b: u64, ldb: usize, sb: usize, beta: f32, cp: u64, ldc: usize, sc: usize, count: usize) -> Res<()> {
         let ev = self.kt_begin();
-        let r = unsafe { self.c.sgemm_batched(ta, tb, m, n, k, 1.0, a, lda, sa, b, ldb, sb, beta, cp, ldc, sc, count) };
+        let r = unsafe {
+            if self.tf32 {
+                self.c.sgemm_batched_tf32(ta, tb, m, n, k, 1.0, a, lda, sa, b, ldb, sb, beta, cp, ldc, sc, count)
+            } else {
+                self.c.sgemm_batched(ta, tb, m, n, k, 1.0, a, lda, sa, b, ldb, sb, beta, cp, ldc, sc, count)
+            }
+        };
         self.kt_end(ev, (4, "cublas gemm batched (gdn chunks)"));
         r
     }
@@ -1833,6 +1843,114 @@ fn gdn_chunk(t: usize) -> Option<usize> {
 /// The largest chunk (`GDC_MAX` of nvgt.cu).
 const GDC_MAX: usize = 256;
 
+/// A GDN layer's backward for the skill bake's resident step
+/// (`bake::gdn_bwd_dev`) on this module's operator: the forward keeping the
+/// states at chunk starts, then the chunked reverse sweep. The bake's own
+/// per-position BPTT keeps every state of every position (`(t+1)·dk·dv` floats
+/// a v-head) and was 1.55 s of a 2.1 s Qwen3.5-0.8B step at 8 × 288 tokens.
+/// The caller holds the context's lock and passes addresses on its stream;
+/// `raw` is the qkv projection before the conv, `prm` = (a_log, dt_bias,
+/// norm, conv). The scratch stays here, rebuilt when the geometry changes.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn bake_gdn_bwd(
+    c: &'static Ctx,
+    geom: (usize, usize, usize, usize, usize, f32),
+    prm: [u64; 4],
+    raw: u64,
+    z: u64,
+    a: u64,
+    b: u64,
+    dout: u64,
+    draw: u64,
+    dz: u64,
+    da: u64,
+    db: u64,
+) -> Res<()> {
+    let (nb, t, nv, nk, kk, eps) = geom;
+    let f = FUNCS.lock().unwrap().get_or_insert_with(|| FBox(build(c))).0.clone()?;
+    let d = Dev { c, f, _g: None, tf32: !crate::gpu_wgpu::bake_f32_strict() };
+    let g = GdnG { nb, t, nv, nk, kk, eps };
+    let p = GdnP { a_log: prm[0], dt_bias: prm[1], norm: prm[2], conv: prm[3] };
+    static WORK: Mutex<Option<BakeGdnWork>> = Mutex::new(None);
+    let mut wk = WORK.lock().unwrap();
+    if wk.as_ref().is_none_or(|w| w.key != (nb, t, nv, nk)) {
+        drop(wk.take());
+        *wk = Some(BakeGdnWork::new(c, (nb, t, nv, nk))?);
+    }
+    let w = wk.as_ref().expect("built above");
+    let sc = GdnS { dcq: w.dcq.ptr, dqk: w.dqk.ptr, hist: w.hist.ptr, kvh: w.kvh.ptr, oh: w.oh.ptr, per: nb, chunk: w.chunk.as_ref() };
+    unsafe {
+        gdn_core_fwd(&d, g, p, raw, z, a, b, w.pre.ptr, w.cq.ptr, w.out.ptr, Some(&sc))?;
+        gdn_core_bwd(&d, g, p, z, a, b, w.pre.ptr, w.cq.ptr, dout, draw, dz, da, db, &sc, true)
+    }
+}
+
+/// A GDN layer's forward for the skill bake's resident step on this module's
+/// kernels (`nt_gdn_fwd`, a column of the state over GC threads in
+/// registers): conv + SiLU into `pre` / `cq`, the recurrence and the gated
+/// norm into `out`, no states kept. The bake's own `bk_gdn_fwd` walks a whole
+/// column per thread and spills it (4.9 against 4.1 ms a layer at 32 × 128).
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn bake_gdn_fwd_dev(
+    c: &'static Ctx,
+    geom: (usize, usize, usize, usize, usize, f32),
+    prm: [u64; 4],
+    raw: u64,
+    z: u64,
+    a: u64,
+    b: u64,
+    pre: u64,
+    cq: u64,
+    out: u64,
+) -> Res<()> {
+    let (nb, t, nv, nk, kk, eps) = geom;
+    let f = FUNCS.lock().unwrap().get_or_insert_with(|| FBox(build(c))).0.clone()?;
+    let d = Dev { c, f, _g: None, tf32: !crate::gpu_wgpu::bake_f32_strict() };
+    let g = GdnG { nb, t, nv, nk, kk, eps };
+    let p = GdnP { a_log: prm[0], dt_bias: prm[1], norm: prm[2], conv: prm[3] };
+    unsafe { gdn_core_fwd(&d, g, p, raw, z, a, b, pre, cq, out, None) }
+}
+
+/// `bake_gdn_bwd`'s scratch for (sequences, positions, v-heads, k-heads), as
+/// `Work::new` sizes the trainer's with every sequence in one launch.
+struct BakeGdnWork {
+    key: (usize, usize, usize, usize),
+    pre: DBuf,
+    cq: DBuf,
+    out: DBuf,
+    dcq: DBuf,
+    dqk: DBuf,
+    hist: DBuf,
+    kvh: DBuf,
+    oh: DBuf,
+    chunk: Option<GdnC>,
+}
+
+impl BakeGdnWork {
+    fn new(c: &Ctx, key: (usize, usize, usize, usize)) -> Res<Self> {
+        let (nb, t, nv, nk) = key;
+        let n = nb * t;
+        let (vd, cd) = (nv * DKV, 2 * nk * DKV + nv * DKV);
+        let chunk = gdn_chunk(t);
+        let stride = chunk.unwrap_or(2).max(1);
+        Ok(Self {
+            key,
+            pre: DBuf::floats(c, n * cd)?,
+            cq: DBuf::floats(c, n * cd)?,
+            out: DBuf::floats(c, n * vd)?,
+            dcq: DBuf::floats(c, n * cd)?,
+            dqk: DBuf::floats(c, n * nv * 2 * DKV)?,
+            hist: DBuf::floats(c, (nb * nv * t.div_ceil(stride) * DKV * DKV).div_ceil(2))?,
+            kvh: DBuf::floats(c, nb * nv * t * DKV)?,
+            oh: DBuf::floats(c, nb * nv * t * DKV)?,
+            chunk: match chunk {
+                Some(cap) => Some(GdnC::new(c, nb * nv, cap)?),
+                None => None,
+            },
+        })
+    }
+}
+
 /// Scratch of the chunked reverse sweep (`nt_gdc_*`): per unit — one
 /// sequence's v-head — the chunk's `[C][D]` rows, `[C][C]` factors, `[D][D]`
 /// states and per-position scalars, for `units` units and chunks of `c`.
@@ -2919,7 +3037,7 @@ mod tests {
         let norm: Vec<f32> = rnd(DKV, 9, 0.1).iter().map(|x| 1.0 + x).collect();
         let bg = BakeGdn { nv, nk, dk: DKV, dv: DKV, kk, eps: 1e-6, conv: &conv, a_log: &a_log, dt_bias: &dt_bias, norm: &norm };
         let out_ref = bake_gdn_fwd(&qkv, &z, &a, &b, nb, t, &bg).expect("bake forward");
-        let (draw_ref, dz_ref, da_ref, db_ref) = bake_gdn_bwd(&qkv, &z, &a, &b, &dout, nb, t, &bg).expect("bake backward");
+        let (draw_ref, dz_ref, da_ref, db_ref) = super::super::bake::bake_gdn_bwd(&qkv, &z, &a, &b, &dout, nb, t, &bg).expect("bake backward");
         let d = enter().unwrap();
         let up = |v: &[f32]| DBuf::from(v).unwrap();
         let fl = |n: usize| DBuf::floats(d.c, n).unwrap();

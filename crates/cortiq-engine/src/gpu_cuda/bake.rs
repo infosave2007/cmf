@@ -34,6 +34,11 @@ struct BkFuncs {
     gate_bwd: cs::CUfunction,
     gather: cs::CUfunction,
     scatter_add: cs::CUfunction,
+    to_bf16: cs::CUfunction,
+    col_dot_part: cs::CUfunction,
+    col_dot_sum: cs::CUfunction,
+    scale_rows: cs::CUfunction,
+    scale_rows_bf16: cs::CUfunction,
 }
 
 #[derive(Default)]
@@ -43,6 +48,9 @@ struct BkState {
     /// `bake_gemm_dx`'s frozen matrices on the card, by (address, values):
     /// a fingerprint of the values beside them; `w_bytes` held.
     w: HashMap<(usize, usize), (u64, Buf)>,
+    /// The same by bf16 copy, for the resident step's `Gemm::Bf16` products
+    /// (counted in `w_bytes` too).
+    wbf: HashMap<(usize, usize), (u64, Buf)>,
     w_bytes: usize,
     /// A training forward's gate/up planes `[n][2·inter]` by layer, for its
     /// backward (`bake_ffn_bwd` takes them).
@@ -56,6 +64,12 @@ struct BkState {
     /// With `BkStep::through_attn`: each layer's input h, for the backward
     /// through its attention branch (recomputed from it).
     saves_in: Vec<Buf>,
+    /// With output masks (`BkLayer::lin`) and a gradient: each layer's
+    /// attention-output and FFN-down outputs before their gains.
+    saves_lin: Vec<(Buf, Buf)>,
+    /// With output masks: each projection's weight copy with its rows scaled
+    /// by the step's gains, by (address, len, mode) of the host matrix.
+    wsc: HashMap<(usize, usize, bool), Buf>,
 }
 
 impl BkState {
@@ -87,6 +101,7 @@ impl BkState {
             // `CMF_BAKE_W_GB` (default 24): a 4B replica is ~16 GB of f32
             if self.w_bytes + w.len() * 4 > w_cap() {
                 self.w.clear();
+                self.wbf.clear();
                 self.w_bytes = 0;
             }
             let b = Buf::from_slice(w)?;
@@ -95,6 +110,41 @@ impl BkState {
         }
         Ok(self.w[&key].1.ptr)
     }
+
+    /// A frozen matrix as the A operand of a `mode` product: its bf16 copy
+    /// under `Gemm::Bf16` (rounded on the host once, kept like `weight`),
+    /// else the f32 one.
+    fn wm(&mut self, w: &[f32], mode: Gemm) -> Res<u64> {
+        if mode != Gemm::Bf16 {
+            return self.weight(w);
+        }
+        let fp = crate::gpu::fp_f32(w);
+        let key = (w.as_ptr() as usize, w.len());
+        if !self.wbf.get(&key).is_some_and(|(f, _)| *f == fp) {
+            if let Some((_, old)) = self.wbf.remove(&key) {
+                self.w_bytes -= old.bytes;
+            }
+            if self.w_bytes + w.len() * 2 > w_cap() {
+                self.w.clear();
+                self.wbf.clear();
+                self.w_bytes = 0;
+            }
+            let h: Vec<u16> = w.iter().map(|&v| bf16_bits(v)).collect();
+            let b = Buf::from_slice(&h)?;
+            self.w_bytes += b.bytes;
+            self.wbf.insert(key, (fp, b));
+        }
+        Ok(self.wbf[&key].1.ptr)
+    }
+}
+
+/// f32 → bf16 bits, rounded to nearest even (as `bk_to_bf16`).
+fn bf16_bits(v: f32) -> u16 {
+    let u = v.to_bits();
+    if u & 0x7fff_ffff > 0x7f80_0000 {
+        return ((u >> 16) | 0x40) as u16;
+    }
+    ((u + 0x7fff + ((u >> 16) & 1)) >> 16) as u16
 }
 
 // SAFETY: the functions are used under the context's state lock.
@@ -115,6 +165,32 @@ fn gemm_mode() -> Gemm {
     } else {
         Gemm::Tf32
     }
+}
+
+/// The resident step's weight products (projections, FFN, their
+/// transposes): `CMF_BAKE_RES_BF16=1` gives them bf16 operands with f32
+/// accumulation — the precision torch's bf16 autocast trains a LoRA in, at
+/// twice TF32's tensor rate on a GeForce card. The attention products, the
+/// head and the GDN gates keep `gemm_mode()` / f32. Default: `gemm_mode()`.
+fn res_mode() -> Gemm {
+    static BF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BF.get_or_init(|| std::env::var("CMF_BAKE_RES_BF16").as_deref() == Ok("1")) {
+        Gemm::Bf16
+    } else {
+        gemm_mode()
+    }
+}
+
+/// `x` (`cnt` f32 values on the card) as the B operand of a `mode` product:
+/// converted into scratch `name` under `Gemm::Bf16`, else `x` itself.
+unsafe fn bop(c: &Ctx, s: &mut BkState, f: &BkFuncs, x: u64, cnt: usize, name: &'static str, mode: Gemm) -> Res<u64> {
+    if mode != Gemm::Bf16 {
+        return Ok(x);
+    }
+    let y = s.scr(name, cnt * 2)?;
+    let n = cnt as i64;
+    unsafe { c.launch(f.to_bf16, ((cnt as u64).div_ceil(256) as u32, 1), 256, 0, kargs!(x, y, n))? };
+    Ok(y)
 }
 
 /// The geometry and frozen constants of one GDN layer.
@@ -175,6 +251,11 @@ fn funcs(c: &Ctx, s: &mut BkState, dk: usize, dv: usize) -> Res<BkFuncs> {
                 gate_bwd: func(m, "bk_gate_bwd")?,
                 gather: func(m, "bk_gather")?,
                 scatter_add: func(m, "bk_scatter_add")?,
+                to_bf16: func(m, "bk_to_bf16")?,
+                col_dot_part: func(m, "bk_col_dot_part")?,
+                col_dot_sum: func(m, "bk_col_dot_sum")?,
+                scale_rows: func(m, "bk_scale_rows")?,
+                scale_rows_bf16: func(m, "bk_scale_rows_bf16")?,
             })
         })
         .clone()
@@ -866,6 +947,79 @@ pub struct BkLayer<'a> {
     pub inter: usize,
     /// The mask's gain σ(m) per neuron (the act's scale).
     pub gain: &'a [f32],
+    /// `--mask-scope linear`: a gain σ(m) per output row of every projection
+    /// of the layer, laid out as [`lin_layout`] gives; None: no output masks.
+    pub lin: Option<&'a [f32]>,
+}
+
+/// Where each projection's output gains sit in a layer's `BkLayer::lin`
+/// (and its gradient in `BkOut::dlin`): GDN `[qkv | z | a | b | out | gate |
+/// up | down]`, full attention `[fused qkv | o | gate | up | down]` (z, a, b
+/// empty). Offsets and lengths in floats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinOff {
+    pub qkv: (usize, usize),
+    pub z: (usize, usize),
+    pub a: (usize, usize),
+    pub b: (usize, usize),
+    pub out: (usize, usize),
+    pub gate: (usize, usize),
+    pub up: (usize, usize),
+    pub down: (usize, usize),
+    pub len: usize,
+}
+
+/// The output-gain layout of a layer (see [`LinOff`]).
+pub fn lin_layout(attn: &BkAttn, inter: usize, hsz: usize) -> LinOff {
+    let (qkv, z, ab) = match attn {
+        BkAttn::Gdn(g, _) => (g.c_dim(), g.nv * g.dv, g.nv),
+        BkAttn::Full(a) => {
+            let (qdim, kvdim) = (a.nh * a.hd, a.nkv * a.hd);
+            ((if a.gated { 2 * qdim } else { qdim }) + 2 * kvdim, 0, 0)
+        }
+    };
+    let mut at = 0usize;
+    let mut take = |len: usize| {
+        let r = (at, len);
+        at += len;
+        r
+    };
+    let (qkv, z, a, b, out, gate, up, down) = (take(qkv), take(z), take(ab), take(ab), take(hsz), take(inter), take(inter), take(hsz));
+    LinOff { qkv, z, a, b, out, gate, up, down, len: at }
+}
+
+/// The `mode` copy of the frozen matrix `w` (`rows` × the rest) with output
+/// row r scaled by the gain at `g + 4r` — the output mask in the weight:
+/// `(diag(g) W) x` is the gained output, and its transpose carries the
+/// gradient straight back to x.
+unsafe fn wscaled(c: &Ctx, s: &mut BkState, f: &BkFuncs, w: &[f32], rows: usize, g: u64, mode: Gemm) -> Res<u64> {
+    let cols = w.len() / rows;
+    let src = s.wm(w, mode)?;
+    let half = mode == Gemm::Bf16;
+    let key = (w.as_ptr() as usize, w.len(), half);
+    let bytes = w.len() * if half { 2 } else { 4 };
+    if !s.wsc.get(&key).is_some_and(|b| b.bytes >= bytes) {
+        s.wsc.insert(key, Buf::new(bytes)?);
+    }
+    let dst = s.wsc[&key].ptr;
+    let cols_i = cols as i32;
+    let grid = (cols.div_ceil(256) as u32, rows as u32);
+    unsafe { c.launch(if half { f.scale_rows_bf16 } else { f.scale_rows }, grid, 256, 0, kargs!(src, g, dst, cols_i))? };
+    Ok(dst)
+}
+
+/// `dg[j] += Σ_r y[r][j]·dy[r][j]` (÷ g[j] with `div`: y is the gained
+/// output), in a fixed order.
+unsafe fn col_dot(c: &Ctx, s: &mut BkState, f: &BkFuncs, y: u64, dy: u64, g: u64, dg: u64, n: usize, m: usize, div: bool) -> Res<()> {
+    const ROWS: usize = 128;
+    let chunks = n.div_ceil(ROWS);
+    let part = s.scr("lindot", chunks * m * 4)?;
+    let (n_i, m_i, rows_i, ch_i, div_i) = (n as i64, m as i32, ROWS as i32, chunks as i32, div as i32);
+    let gx = m.div_ceil(256) as u32;
+    unsafe {
+        c.launch(f.col_dot_part, (gx, chunks as u32), 256, 0, kargs!(y, dy, part, n_i, m_i, rows_i))?;
+        c.launch(f.col_dot_sum, (gx, 1), 256, 0, kargs!(part, g, dg, ch_i, m_i, div_i))
+    }
 }
 
 /// One Phase-A step (or a held-out pass without `grad`) of the skill bake.
@@ -883,6 +1037,11 @@ pub struct BkStep<'a> {
     pub lm: &'a [f32],
     /// Scored target rows (the token predicted from row − 1).
     pub targets: &'a [usize],
+    /// The exact classifier (`--focus-tokens`): `lm` holds only the class
+    /// rows, and this is each target's class (a row of `lm`); the
+    /// cross-entropy and argmax are over the classes. None: the targets are
+    /// the token ids and `lm` the whole head.
+    pub classes: Option<&'a [u32]>,
     pub scale: f32,
     pub grad: bool,
     /// The backward also runs through every frozen attention (and GDN)
@@ -897,10 +1056,13 @@ pub struct BkOut {
     pub nll: Vec<f32>,
     pub argmax: Vec<u32>,
     pub dmask: Vec<Vec<f32>>,
+    /// With output masks and `grad`: the loss gradient per output gain of
+    /// each layer, laid out as `BkLayer::lin` (empty otherwise).
+    pub dlin: Vec<Vec<f32>>,
 }
 
 /// The full-attention layer forward on the card: `x` (normed rows) → `y`.
-unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u64, y: u64, b: usize, t: usize, hsz: usize, eps: f32, gemma: bool) -> Res<()> {
+unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u64, y: u64, b: usize, t: usize, hsz: usize, eps: f32, gemma: bool, gw: Option<(u64, u64)>) -> Res<()> {
     let (n, nh, nkv, hd) = (b * t, a.nh, a.nkv, a.hd);
     let (qdim, kvdim, rep) = (nh * hd, nkv * hd, nh / nkv);
     let qrows = if a.gated { 2 * qdim } else { qdim };
@@ -908,8 +1070,12 @@ unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u6
     if a.wqkv.len() != fused * hsz || a.wo.len() != hsz * qdim || hd > 512 || a.rope.len() < t * a.half * 2 {
         return Err("full attention geometry".into());
     }
-    let mode = gemm_mode();
-    let (wq, wo) = (s.weight(a.wqkv)?, s.weight(a.wo)?);
+    let (mode, amode) = (res_mode(), gemm_mode());
+    // with output masks the weights come row-scaled (`wscaled`)
+    let (wq, wo) = match gw {
+        Some(w) => w,
+        None => (s.wm(a.wqkv, mode)?, s.wm(a.wo, mode)?),
+    };
     let rope = s.up(c, "rope", a.rope)?;
     let (qn, kn) = (match a.q_norm { Some(w) => s.up(c, "qn", w)?, None => s.scr("qn", 4)? }, match a.k_norm { Some(w) => s.up(c, "kn", w)?, None => s.scr("kn", 4)? });
     let qkv = s.scr("qkv", n * fused * 4)?;
@@ -924,21 +1090,23 @@ unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u6
     let (b_i, one, rep_i, w_i) = (b as i32, 1i32, rep as i32, a.window.map_or(0, |w| w as i32));
     let scale = 1.0 / (hd as f32).sqrt();
     unsafe {
-        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, fused, mode)?;
+        let xo = bop(c, s, f, x, n * hsz, "bfx", mode)?;
+        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, fused, mode)?;
         c.launch(f.attn_prep, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, qr, kr, vp, gt, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
         let grid = ((per as u64).div_ceil(256) as u32, 1);
         c.launch(f.attn_perm, grid, 256, 0, kargs!(qr, qp, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(kr, kp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(vp, vpp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
-        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, mode)?;
+        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, amode)?;
         c.launch(f.softmax_fwd, ((cnt * t) as u32, 1), 128, 0, kargs!(sm, pm, ptm, t_i, w_i))?;
-        c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, mode)?;
+        c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, amode)?;
         c.launch(f.attn_unperm, (((n * qdim) as u64).div_ceil(256) as u32, 1), 256, 0, kargs!(op, ao, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         if a.gated {
             let tot = (n * qdim) as i64;
             c.launch(f.gate_mul, (((n * qdim) as u64).div_ceil(256) as u32, 1), 256, 0, kargs!(ao, gt, tot))?;
         }
-        c.gemm(true, false, hsz, n, qdim, 1.0, wo, qdim, ao, qdim, 0.0, y, hsz, mode)?;
+        let aoo = bop(c, s, f, ao, n * qdim, "bfy", mode)?;
+        c.gemm(true, false, hsz, n, qdim, 1.0, wo, qdim, aoo, qdim, 0.0, y, hsz, mode)?;
     }
     Ok(())
 }
@@ -949,7 +1117,7 @@ unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u6
 /// RoPE, P; then o_proj, the output gate, the core, RoPE and the q/k norm
 /// backward, the projections' transpose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize, eps: f32, gemma: bool) -> Res<()> {
+unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize, eps: f32, gemma: bool, gq: Option<(u64, u64, u64, u64)>) -> Res<()> {
     let (n, nh, nkv, hd) = (b * t, a.nh, a.nkv, a.hd);
     let (qdim, kvdim, rep) = (nh * hd, nkv * hd, nh / nkv);
     let qrows = if a.gated { 2 * qdim } else { qdim };
@@ -957,8 +1125,12 @@ unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x
     if a.wqkv.len() != fused * hsz || a.wo.len() != hsz * qdim || hd > 512 || a.rope.len() < t * a.half * 2 {
         return Err("full attention geometry".into());
     }
-    let mode = gemm_mode();
-    let (wq, wo) = (s.weight(a.wqkv)?, s.weight(a.wo)?);
+    let (mode, amode) = (res_mode(), gemm_mode());
+    // gq = (row-scaled wqkv, row-scaled wo, the qkv gains, their gradient)
+    let (wq, wo) = match gq {
+        Some((wq, wo, _, _)) => (wq, wo),
+        None => (s.wm(a.wqkv, mode)?, s.wm(a.wo, mode)?),
+    };
     let rope = s.up(c, "rope", a.rope)?;
     let (qn, kn) = (match a.q_norm { Some(w) => s.up(c, "qn", w)?, None => s.scr("qn", 4)? }, match a.k_norm { Some(w) => s.up(c, "kn", w)?, None => s.scr("kn", 4)? });
     let qkv = s.scr("qkv", n * fused * 4)?;
@@ -985,36 +1157,45 @@ unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x
     let kvg = (((n * kvdim) as u64).div_ceil(256) as u32, 1);
     unsafe {
         // the forward again, to P and the pre-gate head outputs
-        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, fused, mode)?;
+        let xo = bop(c, s, f, x, n * hsz, "bfx", mode)?;
+        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, fused, mode)?;
+
         c.launch(f.attn_prep, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, qr, kr, vp, gt, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(qr, qp, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(kr, kp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(vp, vpp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
-        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, mode)?;
+        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, amode)?;
         c.launch(f.softmax_fwd, ((cnt * t) as u32, 1), 128, 0, kargs!(sm, pm, ptm, t_i, w_i))?;
         if a.gated {
-            c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, mode)?;
+            c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, amode)?;
             c.launch(f.attn_unperm, qg, 256, 0, kargs!(op, ao, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         }
         // dao_eff = dy·Wo; through the output gate
-        c.gemm(false, false, qdim, n, hsz, 1.0, wo, qdim, dy, hsz, 0.0, dao, qdim, mode)?;
+        let dyo = bop(c, s, f, dy, n * hsz, "bfy", mode)?;
+        c.gemm(false, false, qdim, n, hsz, 1.0, wo, qdim, dyo, hsz, 0.0, dao, qdim, mode)?;
         if a.gated {
             let tot = (n * qdim) as i64;
             c.launch(f.gate_bwd, qg, 256, 0, kargs!(dao, ao, gt, dgt, tot))?;
         }
         // the core: dP = dO·Vᵀ, dS, dQ = dS·K/√hd, dK = dSᵀ·Q/√hd, dV = Pᵀ·dO
         c.launch(f.attn_perm, grid, 256, 0, kargs!(dao, dop, b_i, t_i, nh_i, nh_i, hd_i, one))?;
-        c.gemm_batched(true, t, t, hd, 1.0, vpp, hd, t * hd, dop, hd, t * hd, dp, t, t * t, cnt, mode)?;
+        c.gemm_batched(true, t, t, hd, 1.0, vpp, hd, t * hd, dop, hd, t * hd, dp, t, t * t, cnt, amode)?;
         c.launch(f.softmax_bwd, ((cnt * t) as u32, 1), 128, 0, kargs!(pm, dp, ds, dst, t_i))?;
-        c.gemm_batched(false, hd, t, t, scale, kp, hd, t * hd, ds, t, t * t, dqp, hd, t * hd, cnt, mode)?;
-        c.gemm_batched(false, hd, t, t, scale, qp, hd, t * hd, dst, t, t * t, dkp, hd, t * hd, cnt, mode)?;
-        c.gemm_batched(false, hd, t, t, 1.0, dop, hd, t * hd, ptm, t, t * t, dvp, hd, t * hd, cnt, mode)?;
+        c.gemm_batched(false, hd, t, t, scale, kp, hd, t * hd, ds, t, t * t, dqp, hd, t * hd, cnt, amode)?;
+        c.gemm_batched(false, hd, t, t, scale, qp, hd, t * hd, dst, t, t * t, dkp, hd, t * hd, cnt, amode)?;
+        c.gemm_batched(false, hd, t, t, 1.0, dop, hd, t * hd, ptm, t, t * t, dvp, hd, t * hd, cnt, amode)?;
         c.launch(f.attn_unperm, qg, 256, 0, kargs!(dqp, dq, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         c.launch(f.attn_unperm, kvg, 256, 0, kargs!(dkp, dk, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         c.launch(f.attn_unperm, kvg, 256, 0, kargs!(dvp, dv, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         // RoPE and the q/k norm back to the projections, then their transpose
         c.launch(f.attn_prep_bwd, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, dq, dk, dv, dgt, dqkv, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
-        c.gemm(false, false, hsz, n, fused, 1.0, wq, hsz, dqkv, fused, 0.0, dx, hsz, mode)?;
+        if let Some((_, _, g, dg)) = gq {
+            // qkv holds the gained projection (the row-scaled weight's
+            // output): its gain gradient; the scaled weight carries dqkv back
+            col_dot(c, s, f, qkv, dqkv, g, dg, n, fused, true)?;
+        }
+        let dqo = bop(c, s, f, dqkv, n * fused, "bfx", mode)?;
+        c.gemm(false, false, hsz, n, fused, 1.0, wq, hsz, dqo, fused, 0.0, dx, hsz, mode)?;
     }
     Ok(())
 }
@@ -1024,47 +1205,121 @@ unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x
 /// recomputed from `x`; then out_proj's transpose, the recurrence's BPTT,
 /// the conv's backward and the projections' transpose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn gdn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &BakeGdnW, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize) -> Res<()> {
+unsafe fn gdn_bwd_dev(c: &'static Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &BakeGdnW, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize, lin: Option<(u64, u64, LinOff)>) -> Res<()> {
     let (n, cdim, vd, nv) = (b * t, g.c_dim(), g.nv * g.dv, g.nv);
-    let mode = gemm_mode();
-    let (wq, wz, wa, wb, wo) = (s.weight(w.wqkv)?, s.weight(w.wz)?, s.weight(w.wa)?, s.weight(w.wb)?, s.weight(w.wout)?);
+    let mode = res_mode();
+    let (wq, wz, wa, wb, wo) = match lin {
+        // with output masks: the row-scaled weights (the gains live in them)
+        Some((gl, _, o)) => {
+            let at = |r: (usize, usize)| gl + (r.0 * 4) as u64;
+            unsafe {
+                (
+                    wscaled(c, s, f, w.wqkv, cdim, at(o.qkv), mode)?,
+                    wscaled(c, s, f, w.wz, vd, at(o.z), mode)?,
+                    wscaled(c, s, f, w.wa, nv, at(o.a), Gemm::F32)?,
+                    wscaled(c, s, f, w.wb, nv, at(o.b), Gemm::F32)?,
+                    wscaled(c, s, f, w.wout, hsz, at(o.out), mode)?,
+                )
+            }
+        }
+        None => (s.wm(w.wqkv, mode)?, s.wm(w.wz, mode)?, s.weight(w.wa)?, s.weight(w.wb)?, s.wm(w.wout, mode)?),
+    };
     let (qkv, z, a, bb) = (s.scr("qkv", n * cdim * 4)?, s.scr("z", n * vd * 4)?, s.scr("a", n * nv * 4)?, s.scr("b", n * nv * 4)?);
     let (taps, alog, dtb, nw) = (s.up(c, "taps", g.conv)?, s.up(c, "alog", g.a_log)?, s.up(c, "dtb", g.dt_bias)?, s.up(c, "nw", g.norm)?);
-    let (pre, cq) = (s.scr("pre", n * cdim * 4)?, s.scr("cq", n * cdim * 4)?);
     let dof = s.scr("bdof", n * vd * 4)?;
-    let (dcq, draw) = (s.scr("bdcq", n * cdim * 4)?, s.scr("bdraw", n * cdim * 4)?);
+    let draw = s.scr("bdraw", n * cdim * 4)?;
     let (dz, da, db) = (s.scr("bdz", n * vd * 4)?, s.scr("bda", n * nv * 4)?, s.scr("bdb", n * nv * 4)?);
-    let per = seqs_per_launch(g, t, b);
-    let hist = s.scr("bhist", per * g.nv * (t + 1) * g.dk * g.dv * 4)?;
-    let kvh = s.scr("bkvh", per * g.nv * t * g.dv * 4)?;
-    let oh = s.scr("boh", per * g.nv * t * g.dv * 4)?;
+    // The NVG trainer's operator (states at chunk starts, the chunked reverse
+    // sweep) for 128-wide heads; `CMF_BAKE_GDN_NVG=0` keeps the bake's own
+    // per-position BPTT below.
+    let nvg = g.dk == 128 && g.dv == 128 && std::env::var("CMF_BAKE_GDN_NVG").as_deref() != Ok("0");
     let (n_i, t_i, cd_i, kk_i, nv_i, nk_i) = (n as i32, t as i32, cdim as i32, g.kk as i32, nv as i32, g.nk as i32);
     let eps = g.eps;
     let tot = (n * cdim) as u64;
     unsafe {
-        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, cdim, mode)?;
-        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, x, hsz, 0.0, z, vd, mode)?;
+        let xo = bop(c, s, f, x, n * hsz, "bfx", mode)?;
+        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, cdim, mode)?;
+        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, xo, hsz, 0.0, z, vd, mode)?;
         c.gemm(true, false, nv, n, hsz, 1.0, wa, hsz, x, hsz, 0.0, a, nv, Gemm::F32)?;
         c.gemm(true, false, nv, n, hsz, 1.0, wb, hsz, x, hsz, 0.0, bb, nv, Gemm::F32)?;
-        c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
         // dof = dy·Wout
-        c.gemm(false, false, vd, n, hsz, 1.0, wo, vd, dy, hsz, 0.0, dof, vd, mode)?;
-        cu::memset_d8_async(dcq, 0, n * cdim * 4, c.stream).map_err(derr)?;
-        let mut s0 = 0usize;
-        while s0 < b {
-            let nb = per.min(b - s0);
-            let seq0 = s0 as i32;
-            c.launch(f.gdn_bwd, (nv as u32, nb as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, dof, dcq, dz, da, db, hist, kvh, oh, t_i, nv_i, nk_i, eps, seq0))?;
-            s0 += nb;
+        let dyo = bop(c, s, f, dy, n * hsz, "bfy", mode)?;
+        c.gemm(false, false, vd, n, hsz, 1.0, wo, vd, dyo, hsz, 0.0, dof, vd, mode)?;
+        if nvg {
+            super::nvgt::bake_gdn_bwd(c, (b, t, nv, g.nk, g.kk, eps), [alog, dtb, nw, taps], qkv, z, a, bb, dof, draw, dz, da, db).map_err(|e| format!("nvg gdn: {e}"))?;
+        } else {
+            let (pre, cq) = (s.scr("pre", n * cdim * 4)?, s.scr("cq", n * cdim * 4)?);
+            let dcq = s.scr("bdcq", n * cdim * 4)?;
+            let per = seqs_per_launch(g, t, b);
+            let hist = s.scr("bhist", per * g.nv * (t + 1) * g.dk * g.dv * 4)?;
+            let kvh = s.scr("bkvh", per * g.nv * t * g.dv * 4)?;
+            let oh = s.scr("boh", per * g.nv * t * g.dv * 4)?;
+            c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
+            cu::memset_d8_async(dcq, 0, n * cdim * 4, c.stream).map_err(derr)?;
+            let mut s0 = 0usize;
+            while s0 < b {
+                let nb = per.min(b - s0);
+                let seq0 = s0 as i32;
+                c.launch(f.gdn_bwd, (nv as u32, nb as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, dof, dcq, dz, da, db, hist, kvh, oh, t_i, nv_i, nk_i, eps, seq0))?;
+                s0 += nb;
+            }
+            c.launch(f.conv_bwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pre, dcq, taps, draw, n_i, t_i, cd_i, kk_i))?;
         }
-        c.launch(f.conv_bwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pre, dcq, taps, draw, n_i, t_i, cd_i, kk_i))?;
+        if let Some((gl, dl, o)) = lin {
+            // the inputs hold the gained projections: the gain gradients (the
+            // row-scaled weights carry each gradient back to x)
+            let at = |base: u64, r: (usize, usize)| base + (r.0 * 4) as u64;
+            for (y, d, r, m) in [(qkv, draw, o.qkv, cdim), (z, dz, o.z, vd), (a, da, o.a, nv), (bb, db, o.b, nv)] {
+                col_dot(c, s, f, y, d, at(gl, r), at(dl, r), n, m, true)?;
+            }
+        }
         // dx = draw·Wqkv + dz·Wz + da·Wa + db·Wb
-        c.gemm(false, false, hsz, n, cdim, 1.0, wq, hsz, draw, cdim, 0.0, dx, hsz, mode)?;
-        c.gemm(false, false, hsz, n, vd, 1.0, wz, hsz, dz, vd, 1.0, dx, hsz, mode)?;
+        let dro = bop(c, s, f, draw, n * cdim, "bfx", mode)?;
+        c.gemm(false, false, hsz, n, cdim, 1.0, wq, hsz, dro, cdim, 0.0, dx, hsz, mode)?;
+        let dzo = bop(c, s, f, dz, n * vd, "bfy", mode)?;
+        c.gemm(false, false, hsz, n, vd, 1.0, wz, hsz, dzo, vd, 1.0, dx, hsz, mode)?;
         c.gemm(false, false, hsz, n, nv, 1.0, wa, hsz, da, nv, 1.0, dx, hsz, Gemm::F32)?;
         c.gemm(false, false, hsz, n, nv, 1.0, wb, hsz, db, nv, 1.0, dx, hsz, Gemm::F32)?;
     }
     Ok(())
+}
+
+/// `CMF_BAKE_RES_PROF=1`: the step synchronizes after each section and
+/// prints the wall time per section (the syncs remove the overlap between
+/// sections, so the sum runs a little over the plain step).
+struct StepProf {
+    on: bool,
+    t: std::time::Instant,
+    secs: Vec<(&'static str, f64)>,
+}
+
+impl StepProf {
+    fn new() -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("CMF_BAKE_RES_PROF").as_deref() == Ok("1"));
+        Self { on, t: std::time::Instant::now(), secs: Vec::new() }
+    }
+
+    fn mark(&mut self, c: &Ctx, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        let _ = c.sync();
+        let dt = self.t.elapsed().as_secs_f64() * 1e3;
+        match self.secs.iter_mut().find(|(n, _)| *n == name) {
+            Some(x) => x.1 += dt,
+            None => self.secs.push((name, dt)),
+        }
+        self.t = std::time::Instant::now();
+    }
+
+    fn report(&self) {
+        if self.on {
+            let total: f64 = self.secs.iter().map(|x| x.1).sum();
+            let parts: Vec<String> = self.secs.iter().map(|(n, ms)| format!("{n} {ms:.1}")).collect();
+            eprintln!("[bake-res-prof cuda] {total:.1} ms: {}", parts.join(" | "));
+        }
+    }
 }
 
 /// A whole Phase-A step of the skill bake on the card: embeddings, every
@@ -1083,13 +1338,18 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
         return None;
     }
     let vocab = st.lm.len() / hsz;
-    if st.ids.iter().any(|&i| i as usize >= st.embed.len() / hsz) || st.targets.iter().any(|&r| st.ids[r] as usize >= vocab) {
+    let target_of = |k: usize| -> usize { st.classes.map_or(st.ids[st.targets[k]] as usize, |c| c[k] as usize) };
+    if st.ids.iter().any(|&i| i as usize >= st.embed.len() / hsz)
+        || st.classes.is_some_and(|c| c.len() != st.targets.len())
+        || (0..st.targets.len()).any(|k| target_of(k) >= vocab)
+    {
         return None;
     }
     let _g = c.st.lock().unwrap();
     let mut gs = STATE.lock().unwrap();
     let s = gs.get_or_insert_with(BkState::default);
-    let mut run = || -> Res<BkOut> {
+    let mut prof = StepProf::new();
+    let mut run = |s: &mut BkState| -> Res<BkOut> {
         let gdn_dims = st.layers.iter().find_map(|l| match &l.attn {
             BkAttn::Gdn(g, _) => Some((g.dk, g.dv)),
             _ => None,
@@ -1098,7 +1358,7 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             Some((dk, dv)) => funcs(c, s, dk, dv)?,
             None => funcs(c, s, 128, 128)?,
         };
-        let mode = gemm_mode();
+        let (mode, amode) = (res_mode(), gemm_mode());
         let (eps, gm) = (st.eps, st.gemma as i32);
         let hsz_i = hsz as i32;
         let gelu = (st.act == crate::fcd_ops::FfnAct::GeluErf) as i32;
@@ -1114,6 +1374,45 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             if sv.1.bytes < need[1] { sv.1 = Buf::new(need[1])?; }
             if st.grad && sv.2.bytes < need[2] { sv.2 = Buf::new(need[2])?; }
         }
+        // output masks (`BkLayer::lin`): every layer's gains in one buffer,
+        // their gradient beside, the output projections' pre-gain outputs
+        let lin_on = st.layers.iter().any(|l| l.lin.is_some());
+        let offs: Vec<LinOff> = st.layers.iter().map(|l| lin_layout(&l.attn, l.inter, hsz)).collect();
+        let lmax = offs.iter().map(|o| o.len).max().unwrap_or(0);
+        let (glin, dlin) = if lin_on {
+            if st.layers.iter().zip(&offs).any(|(l, o)| l.lin.map(<[f32]>::len) != Some(o.len)) {
+                return Err("output masks: every layer needs its gains, laid out as lin_layout gives".into());
+            }
+            if st.grad && !st.through_attn {
+                return Err("output masks train through the attention branches (--through-attn)".into());
+            }
+            let mut flat = vec![0f32; nl * lmax];
+            for (li, l) in st.layers.iter().enumerate() {
+                flat[li * lmax..li * lmax + offs[li].len].copy_from_slice(l.lin.expect("checked above"));
+            }
+            let g = s.up(c, "rlin", &flat)?;
+            let d = if st.grad {
+                let d = s.scr("rdlin", nl * lmax * 4)?;
+                unsafe { cu::memset_d8_async(d, 0, nl * lmax * 4, c.stream).map_err(derr)? };
+                d
+            } else {
+                0
+            };
+            if st.grad {
+                while s.saves_lin.len() < nl {
+                    s.saves_lin.push((Buf::new(4)?, Buf::new(4)?));
+                }
+                for sv in s.saves_lin.iter_mut().take(nl) {
+                    if sv.0.bytes < n * hsz * 4 { sv.0 = Buf::new(n * hsz * 4)?; }
+                    if sv.1.bytes < n * hsz * 4 { sv.1 = Buf::new(n * hsz * 4)?; }
+                }
+            }
+            (g, d)
+        } else {
+            (0, 0)
+        };
+        // a layer's gains (or their gradient) for one projection
+        let gat = |base: u64, li: usize, r: (usize, usize)| base + ((li * lmax + r.0) * 4) as u64;
         let emb = s.weight(st.embed)?;
         let wl = s.weight(st.lm)?;
         let ids: Vec<i32> = st.ids.iter().map(|&i| i as i32).collect();
@@ -1152,47 +1451,93 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             match &l.attn {
                 BkAttn::Gdn(g, w) => {
                     let (cdim, vd, nv) = (g.c_dim(), g.nv * g.dv, g.nv);
-                    let (wq, wz, wa, wb, wo) = (s.weight(w.wqkv)?, s.weight(w.wz)?, s.weight(w.wa)?, s.weight(w.wb)?, s.weight(w.wout)?);
+                    let (wq, wz, wa, wb, wo) = if lin_on {
+                        // the output masks ride in row-scaled weights
+                        let o = offs[li];
+                        unsafe {
+                            (
+                                wscaled(c, s, &f, w.wqkv, cdim, gat(glin, li, o.qkv), mode)?,
+                                wscaled(c, s, &f, w.wz, vd, gat(glin, li, o.z), mode)?,
+                                wscaled(c, s, &f, w.wa, nv, gat(glin, li, o.a), Gemm::F32)?,
+                                wscaled(c, s, &f, w.wb, nv, gat(glin, li, o.b), Gemm::F32)?,
+                                wscaled(c, s, &f, w.wout, hsz, gat(glin, li, o.out), mode)?,
+                            )
+                        }
+                    } else {
+                        (s.wm(w.wqkv, mode)?, s.wm(w.wz, mode)?, s.weight(w.wa)?, s.weight(w.wb)?, s.wm(w.wout, mode)?)
+                    };
                     let (qkv, z, a, bb) = (s.scr("qkv", n * cdim * 4)?, s.scr("z", n * vd * 4)?, s.scr("a", n * nv * 4)?, s.scr("b", n * nv * 4)?);
                     let (taps, alog, dtb, nw) = (s.up(c, "taps", g.conv)?, s.up(c, "alog", g.a_log)?, s.up(c, "dtb", g.dt_bias)?, s.up(c, "nw", g.norm)?);
                     let (pre, cq, of) = (s.scr("pre", n * cdim * 4)?, s.scr("cq", n * cdim * 4)?, s.scr("of", n * vd * 4)?);
                     let (t_i, cd_i, kk_i, nv_i, nk_i, seq0) = (t as i32, cdim as i32, g.kk as i32, nv as i32, g.nk as i32, 0i32);
                     let geps = g.eps;
                     unsafe {
-                        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, nrm, hsz, 0.0, qkv, cdim, mode)?;
-                        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, nrm, hsz, 0.0, z, vd, mode)?;
+                        let xo = bop(c, s, &f, nrm, n * hsz, "bfx", mode)?;
+                        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, cdim, mode)?;
+                        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, xo, hsz, 0.0, z, vd, mode)?;
                         c.gemm(true, false, nv, n, hsz, 1.0, wa, hsz, nrm, hsz, 0.0, a, nv, Gemm::F32)?;
                         c.gemm(true, false, nv, n, hsz, 1.0, wb, hsz, nrm, hsz, 0.0, bb, nv, Gemm::F32)?;
-                        let tot = (n * cdim) as u64;
-                        c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
-                        c.launch(f.gdn_fwd, (nv as u32, b as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, of, t_i, nv_i, nk_i, geps, seq0))?;
-                        c.gemm(true, false, hsz, n, vd, 1.0, wo, vd, of, vd, 0.0, ao, hsz, mode)?;
+                        if g.dk == 128 && g.dv == 128 && std::env::var("CMF_BAKE_GDN_NVG").as_deref() != Ok("0") {
+                            // the NVG trainer's forward (the backward runs on its operator too)
+                            super::nvgt::bake_gdn_fwd_dev(c, (b, t, nv, g.nk, g.kk, geps), [alog, dtb, nw, taps], qkv, z, a, bb, pre, cq, of)
+                                .map_err(|e| format!("nvg gdn forward: {e}"))?;
+                        } else {
+                            let tot = (n * cdim) as u64;
+                            c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
+                            c.launch(f.gdn_fwd, (nv as u32, b as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, of, t_i, nv_i, nk_i, geps, seq0))?;
+                        }
+                        let oo = bop(c, s, &f, of, n * vd, "bfy", mode)?;
+                        c.gemm(true, false, hsz, n, vd, 1.0, wo, vd, oo, vd, 0.0, ao, hsz, mode)?;
                     }
+                    prof.mark(c, "fwd.gdn");
                 }
-                BkAttn::Full(fa) => unsafe { full_attn_dev(c, s, &f, fa, nrm, ao, b, t, hsz, eps, st.gemma)? },
+                BkAttn::Full(fa) => {
+                    let gw = if lin_on {
+                        let (qdim, kvdim) = (fa.nh * fa.hd, fa.nkv * fa.hd);
+                        let fused = (if fa.gated { 2 * qdim } else { qdim }) + 2 * kvdim;
+                        unsafe { Some((wscaled(c, s, &f, fa.wqkv, fused, gat(glin, li, offs[li].qkv), mode)?, wscaled(c, s, &f, fa.wo, hsz, gat(glin, li, offs[li].out), mode)?)) }
+                    } else {
+                        None
+                    };
+                    unsafe { full_attn_dev(c, s, &f, fa, nrm, ao, b, t, hsz, eps, st.gemma, gw)? };
+                    prof.mark(c, "fwd.full");
+                }
             }
             let inter = l.inter;
-            let wgu = s.weight(l.gu)?;
-            let wdn = s.weight(l.down)?;
+            let (wgu, wdn) = if lin_on {
+                unsafe { (wscaled(c, s, &f, l.gu, 2 * inter, gat(glin, li, offs[li].gate), mode)?, wscaled(c, s, &f, l.down, hsz, gat(glin, li, offs[li].down), mode)?) }
+            } else {
+                (s.wm(l.gu, mode)?, s.wm(l.down, mode)?)
+            };
             let gain = s.up(c, "rgain", l.gain)?;
             let both = if st.grad { s.saves[li].2.ptr } else { s.scr("rboth", n * 2 * inter * 4)? };
             let (in_i, one) = (inter as i32, 1i32);
             unsafe {
+                if lin_on && st.grad {
+                    // the attention output (gained already) kept for its gain's gradient
+                    cu::memcpy_dtod_async(s.saves_lin[li].0.ptr, ao, n * hsz * 4, c.stream).map_err(derr)?;
+                }
                 c.launch(f.add, gh, 256, 0, kargs!(h, ao, h1, tot_h))?;
                 c.launch(f.rmsnorm, (n as u32, 1), 256, 0, kargs!(h1, pln, nrm, inv2, hsz_i, eps, gm))?;
-                c.gemm(true, false, 2 * inter, n, hsz, 1.0, wgu, hsz, nrm, hsz, 0.0, both, 2 * inter, mode)?;
+                let xo = bop(c, s, &f, nrm, n * hsz, "bfx", mode)?;
+                c.gemm(true, false, 2 * inter, n, hsz, 1.0, wgu, hsz, xo, hsz, 0.0, both, 2 * inter, mode)?;
                 let tot = (n * inter) as u64;
                 c.launch(f.ffn_act, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(both, gain, act, n_i, in_i, gelu, one))?;
-                c.gemm(true, false, hsz, n, inter, 1.0, wdn, inter, act, inter, 0.0, ao, hsz, mode)?;
+                let actb = bop(c, s, &f, act, n * inter, "bfy", mode)?;
+                c.gemm(true, false, hsz, n, inter, 1.0, wdn, inter, actb, inter, 0.0, ao, hsz, mode)?;
+                if lin_on && st.grad {
+                    cu::memcpy_dtod_async(s.saves_lin[li].1.ptr, ao, n * hsz * 4, c.stream).map_err(derr)?;
+                }
                 c.launch(f.add, gh, 256, 0, kargs!(h1, ao, h, tot_h))?;
             }
+            prof.mark(c, "fwd.ffn");
         }
         // final norm, the scored rows' cross-entropy
         let fnw = s.up(c, "rfn", st.final_norm)?;
         let finv = s.scr("rfinv", n * 4)?;
         let k = st.targets.len();
         let src: Vec<i32> = st.targets.iter().map(|&r| (r - 1) as i32).collect();
-        let tg: Vec<i32> = st.targets.iter().map(|&r| st.ids[r] as i32).collect();
+        let tg: Vec<i32> = (0..k).map(|i| target_of(i) as i32).collect();
         let (srcb, tgb) = (Buf::from_slice(&src)?, Buf::from_slice(&tg)?);
         let hs = s.scr("rhs", k * hsz * 4)?;
         let band = ((512usize << 20) / (vocab * 4)).clamp(1, k);
@@ -1208,12 +1553,12 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             while r0 < k {
                 let nb = band.min(k - r0);
                 let xp = hs + (r0 * hsz * 4) as u64;
-                c.gemm(true, false, vocab, nb, hsz, 1.0, wl, hsz, xp, hsz, 0.0, logits, vocab, mode)?;
+                c.gemm(true, false, vocab, nb, hsz, 1.0, wl, hsz, xp, hsz, 0.0, logits, vocab, amode)?;
                 let (tp, np, ap) = (tgb.ptr + (r0 * 4) as u64, nll + (r0 * 4) as u64, arg + (r0 * 4) as u64);
                 c.launch(f.ce_rows, (nb as u32, 1), 1024, 0, kargs!(logits, tp, np, ap, v_i, scale, gr))?;
                 if st.grad {
                     let dp = dhs + (r0 * hsz * 4) as u64;
-                    c.gemm(false, false, hsz, nb, vocab, 1.0, wl, hsz, logits, vocab, 0.0, dp, hsz, mode)?;
+                    c.gemm(false, false, hsz, nb, vocab, 1.0, wl, hsz, logits, vocab, 0.0, dp, hsz, amode)?;
                 }
                 r0 += nb;
             }
@@ -1221,7 +1566,9 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
         let nl_v = dtoh(c, nll, k)?;
         let mut am = vec![0i32; k];
         unsafe { cu::memcpy_dtoh_async(am.as_mut_slice(), arg, c.stream).map_err(derr)? };
+        prof.mark(c, "head");
         let mut dmask = Vec::new();
+        let mut dlin_out: Vec<Vec<f32>> = Vec::new();
         if st.grad {
             // dhn (scattered) → dh through the final norm
             let dhn = s.scr("rdhn", n * hsz * 4)?;
@@ -1239,8 +1586,11 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             }
             for (li, l) in st.layers.iter().enumerate().rev() {
                 let inter = l.inter;
-                let wgu = s.weight(l.gu)?;
-                let wdn = s.weight(l.down)?;
+                let (wgu, wdn) = if lin_on {
+                    unsafe { (wscaled(c, s, &f, l.gu, 2 * inter, gat(glin, li, offs[li].gate), mode)?, wscaled(c, s, &f, l.down, hsz, gat(glin, li, offs[li].down), mode)?) }
+                } else {
+                    (s.wm(l.gu, mode)?, s.wm(l.down, mode)?)
+                };
                 let gain = s.up(c, "rgain", l.gain)?;
                 let pln = s.up(c, "rpln", l.pln)?;
                 let (h1, inv2, both) = (s.saves[li].0.ptr, s.saves[li].1.ptr, s.saves[li].2.ptr);
@@ -1249,14 +1599,28 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                 let acc = 1i32;
                 unsafe {
                     // dact2 = dh·down; mask grad, dgu; dn2 = dgu·gu
-                    c.gemm(false, false, inter, n, hsz, 1.0, wdn, inter, dh, hsz, 0.0, dact, inter, mode)?;
+                    if lin_on {
+                        // the down gain's gradient from the kept (gained) FFN output
+                        let (g, d) = (gat(glin, li, offs[li].down), gat(dlin, li, offs[li].down));
+                        let kept = s.saves_lin[li].1.ptr;
+                        col_dot(c, s, &f, kept, dh, g, d, n, hsz, true)?;
+                    }
+                    let dho = bop(c, s, &f, dh, n * hsz, "bfx", mode)?;
+                    c.gemm(false, false, inter, n, hsz, 1.0, wdn, inter, dho, hsz, 0.0, dact, inter, mode)?;
                     c.launch(f.ffn_act_bwd, (inter.div_ceil(256) as u32, n.div_ceil(64) as u32), 256, 0, kargs!(both, dact, gain, dgu, dml, n_i, in_i, gelu, one, rows))?;
-                    c.gemm(false, false, hsz, n, 2 * inter, 1.0, wgu, hsz, dgu, 2 * inter, 0.0, dn2, hsz, mode)?;
+                    if lin_on {
+                        // both holds the gained gate/up: their gains' gradient
+                        let (g, d) = (gat(glin, li, offs[li].gate), gat(dlin, li, offs[li].gate));
+                        col_dot(c, s, &f, both, dgu, g, d, n, 2 * inter, true)?;
+                    }
+                    let dguo = bop(c, s, &f, dgu, n * 2 * inter, "bfy", mode)?;
+                    c.gemm(false, false, hsz, n, 2 * inter, 1.0, wgu, hsz, dguo, 2 * inter, 0.0, dn2, hsz, mode)?;
                     // dh1 = dh + post-norm backward (dh accumulates in place);
                     // without through_attn the frozen attention passes dh1
                     // straight to dh_in
                     c.launch(f.rmsnorm_bwd, (n as u32, 1), 256, 0, kargs!(h1, pln, inv2, dn2, dh, hsz_i, gm, acc))?;
                 }
+                prof.mark(c, "bwd.ffn");
                 if st.through_attn {
                     // dh_in = dh1 + input-norm backward of the branch's dX
                     let hin = s.saves_in[li].ptr;
@@ -1264,21 +1628,83 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                     let dn1 = s.scr("rdn1", n * hsz * 4)?;
                     unsafe {
                         c.launch(f.rmsnorm, (n as u32, 1), 256, 0, kargs!(hin, iln, nrm, inv1, hsz_i, eps, gm))?;
+                        // with output masks: the attention output gain's gradient, then dh at the branch's own output
+                        if lin_on {
+                            // the attention output gain's gradient from the kept (gained) output
+                            let (g, d) = (gat(glin, li, offs[li].out), gat(dlin, li, offs[li].out));
+                            let kept = s.saves_lin[li].0.ptr;
+                            col_dot(c, s, &f, kept, dh, g, d, n, hsz, true)?;
+                        }
+                        let dya = dh;
                         match &l.attn {
-                            BkAttn::Full(fa) => full_attn_bwd_dev(c, s, &f, fa, nrm, dh, dn1, b, t, hsz, eps, st.gemma)?,
-                            BkAttn::Gdn(g, w) => gdn_bwd_dev(c, s, &f, g, w, nrm, dh, dn1, b, t, hsz)?,
+                            BkAttn::Full(fa) => {
+                                let gq = if lin_on {
+                                    let (qdim, kvdim) = (fa.nh * fa.hd, fa.nkv * fa.hd);
+                                    let fused = (if fa.gated { 2 * qdim } else { qdim }) + 2 * kvdim;
+                                    Some((
+                                        wscaled(c, s, &f, fa.wqkv, fused, gat(glin, li, offs[li].qkv), mode)?,
+                                        wscaled(c, s, &f, fa.wo, hsz, gat(glin, li, offs[li].out), mode)?,
+                                        gat(glin, li, offs[li].qkv),
+                                        gat(dlin, li, offs[li].qkv),
+                                    ))
+                                } else {
+                                    None
+                                };
+                                full_attn_bwd_dev(c, s, &f, fa, nrm, dya, dn1, b, t, hsz, eps, st.gemma, gq)?
+                            }
+                            BkAttn::Gdn(g, w) => {
+                                let lb = lin_on.then(|| (glin + (li * lmax * 4) as u64, dlin + (li * lmax * 4) as u64, offs[li]));
+                                gdn_bwd_dev(c, s, &f, g, w, nrm, dya, dn1, b, t, hsz, lb)?
+                            }
                         }
                         c.launch(f.rmsnorm_bwd, (n as u32, 1), 256, 0, kargs!(hin, iln, inv1, dn1, dh, hsz_i, gm, acc))?;
                     }
+                    prof.mark(c, if matches!(l.attn, BkAttn::Full(_)) { "bwd.full" } else { "bwd.gdn" });
                 }
             }
             let all = dtoh(c, dm, nl * max_inter)?;
             dmask = st.layers.iter().enumerate().map(|(li, l)| all[li * max_inter..li * max_inter + l.inter].to_vec()).collect();
+            if lin_on {
+                let all = dtoh(c, dlin, nl * lmax)?;
+                dlin_out = offs.iter().enumerate().map(|(li, o)| all[li * lmax..li * lmax + o.len].to_vec()).collect();
+            }
         }
         c.sync()?;
-        Ok(BkOut { nll: nl_v, argmax: am.into_iter().map(|a| a as u32).collect(), dmask })
+        prof.mark(c, "readback");
+        Ok(BkOut { nll: nl_v, argmax: am.into_iter().map(|a| a as u32).collect(), dmask, dlin: dlin_out })
     };
-    match run() {
+    // CMF_BAKE_KT=<n>: the n-th training step on the card (0-based; the
+    // evaluations do not count) runs with every kernel launch timed, printed
+    // per kernel after it
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = if st.grad { CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) } else { usize::MAX };
+    let kt = std::env::var("CMF_BAKE_KT").ok().and_then(|v| v.parse::<usize>().ok()) == Some(call);
+    if kt {
+        super::kt_start();
+    }
+    let mut res = run(s);
+    if kt {
+        let _ = c.sync();
+        super::kt_stop_as(if st.grad { "bake step" } else { "bake eval" });
+    }
+    if matches!(&res, Err(e) if e.contains("OUT_OF_MEMORY")) {
+        // A pass of another shape (the held evaluation's batch, a longer
+        // bucket) left its scratch and saves on the card: free them — the
+        // frozen weights stay — and run the step again before the layer
+        // path takes over (silently ~10x slower for the rest of the bake).
+        let _ = c.sync();
+        s.scr.clear();
+        s.saves.clear();
+        s.saves_in.clear();
+        s.saves_lin.clear();
+        s.planes.clear();
+        res = run(s);
+        if res.is_ok() {
+            tracing::info!("cuda bake resident step: out of memory, scratch freed, step resumed on the card");
+        }
+    }
+    prof.report();
+    match res {
         Ok(o) => Some(o),
         Err(e) => {
             let _ = c.sync();
@@ -1291,6 +1717,20 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host rounding of the bf16 weight copies: nearest, ties to even,
+    /// NaN stays NaN (the kernel `bk_to_bf16` is the same expression).
+    #[test]
+    fn bf16_bits_round_to_nearest_even() {
+        assert_eq!(bf16_bits(1.0), 0x3f80);
+        assert_eq!(bf16_bits(-2.5), 0xc020);
+        assert_eq!(bf16_bits(f32::from_bits(0x3f80_8000)), 0x3f80); // tie, even stays
+        assert_eq!(bf16_bits(f32::from_bits(0x3f81_8000)), 0x3f82); // tie, odd rounds up
+        assert_eq!(bf16_bits(f32::from_bits(0x3f80_8001)), 0x3f81); // above the tie
+        assert_eq!(bf16_bits(f32::INFINITY), 0x7f80);
+        assert!(bf16_bits(f32::NAN) & 0x7fff > 0x7f80);
+        assert_eq!(bf16_bits(f32::from_bits(0x7f7f_ffff)), 0x7f80); // the largest f32 rounds to inf
+    }
 
     fn rnd(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;

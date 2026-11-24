@@ -257,6 +257,17 @@ pub struct BakeHyper {
     /// held scores then report per-tag verdict accuracy and gate on its
     /// macro average.
     pub held_tags: Option<HeldTags>,
+    /// `--mask-scope linear`: the mask sits on the output rows of every
+    /// projection (GDN in-projections and out_proj, q/k/v/o, gate, up, down —
+    /// the DTG-MA notebooks' DTGMALinear) instead of on the FFN neurons;
+    /// the FFN neuron gates stay open. CUDA resident step only.
+    pub mask_linear: bool,
+    /// The notebooks' sparsity term for `mask_linear`: λ · the mean over
+    /// projections of each projection's mean gate.
+    pub lin_l1: f64,
+    /// A previous run's `linear_logits` (per layer, `FcdModel::lin_modules`
+    /// order) to start from.
+    pub lin_logits: Option<Vec<Vec<f32>>>,
 }
 
 impl Default for BakeHyper {
@@ -294,6 +305,9 @@ impl Default for BakeHyper {
             through_attn: false,
             checkpoint_dir: None,
             held_tags: None,
+            mask_linear: false,
+            lin_l1: 0.02,
+            lin_logits: None,
         }
     }
 }
@@ -420,12 +434,21 @@ impl Adam {
 
     /// Global-norm clip + Adam step. `params[i].len() == grads[i].len()`.
     fn step(&mut self, params: &mut [&mut [f32]], grads: &[Vec<f64>], lr_scale: f64) {
+        self.step_clip(params, grads, lr_scale, Some(CLIP))
+    }
+
+    /// Adam with an optional global-norm clip (None: the notebooks' AdamW
+    /// with weight decay 0, which the output masks train with).
+    fn step_clip(&mut self, params: &mut [&mut [f32]], grads: &[Vec<f64>], lr_scale: f64, clip_at: Option<f64>) {
         let gn: f64 = grads
             .iter()
             .flat_map(|g| g.iter().map(|x| x * x))
             .sum::<f64>()
             .sqrt();
-        let clip = if gn > CLIP { CLIP / gn } else { 1.0 };
+        let clip = match clip_at {
+            Some(c) if gn > c => c / gn,
+            _ => 1.0,
+        };
         self.t += 1;
         let (bc1, bc2) = (1.0 - B1.powi(self.t), 1.0 - B2.powi(self.t));
         for (pi, p) in params.iter_mut().enumerate() {
@@ -532,6 +555,31 @@ fn is_scored_target(
             || (target_index + 1 < sequence_end && follow.contains(&ids[target_index + 1])))
 }
 
+/// The class rows of the LM head for the resident exact classifier, built
+/// once per (head, classes) and kept: the card's weight caches key on the
+/// buffer, so a fresh Vec per step would upload it again every step.
+#[cfg(feature = "gpu")]
+fn focus_head(fm: &crate::fcd::FcdModel, focus: &[u32]) -> std::sync::Arc<Vec<f32>> {
+    type Key = (usize, Vec<u32>);
+    static CACHE: std::sync::Mutex<Option<(Key, std::sync::Arc<Vec<f32>>)>> = std::sync::Mutex::new(None);
+    let lm: &[f32] = fm.lm_head.as_deref().unwrap_or(&fm.embed);
+    let key = (lm.as_ptr() as usize, focus.to_vec());
+    let mut c = CACHE.lock().unwrap();
+    if let Some((k, h)) = c.as_ref() {
+        if *k == key {
+            return h.clone();
+        }
+    }
+    let hsz = fm.hidden;
+    let mut rows = Vec::with_capacity(focus.len() * hsz);
+    for &id in focus {
+        rows.extend_from_slice(&lm[id as usize * hsz..(id as usize + 1) * hsz]);
+    }
+    let h = std::sync::Arc::new(rows);
+    *c = Some((key, h.clone()));
+    h
+}
+
 #[cfg(feature = "gpu")]
 thread_local! {
     /// Set while the resident check runs the layer path on the same batch.
@@ -589,6 +637,11 @@ struct Pass<'a> {
     /// The mask backward also runs through each frozen attention (or GDN)
     /// branch (`BakeHyper::through_attn`).
     through_attn: bool,
+    /// `--mask-scope linear`: σ per output row of every projection, per
+    /// layer (`FcdModel::lin_modules` order); None: no output masks.
+    lin: Option<&'a [Vec<f32>]>,
+    /// Where a step adds the loss gradient per output gain.
+    dlin: Option<&'a std::cell::RefCell<Vec<Vec<f64>>>>,
 }
 
 /// Raw-pointer carriers for pooled row writes (disjoint ranges per worker).
@@ -805,7 +858,7 @@ impl Pass<'_> {
         focus_stats: &mut Option<&mut FocusStats>,
     ) -> Option<(f64, usize)> {
         let fm = self.fm;
-        if !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) || !self.focus_tokens.is_empty() || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
+        if !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
             return None;
         }
         if self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
@@ -824,15 +877,40 @@ impl Pass<'_> {
         let scored = targets.len();
         let inv_n = 1.0 / scored as f64;
         let (want, ta) = (grad.is_some(), self.through_attn);
+        // The exact classifier (`--focus-tokens`): the head is the class rows
+        // only, each target its class — the layer path's class-row softmax.
+        let focus = !self.focus_tokens.is_empty();
+        let focus_head = focus.then(|| focus_head(fm, self.focus_tokens));
+        let classes: Vec<u32> = if focus {
+            targets
+                .iter()
+                .map(|&ti| self.focus_tokens.iter().position(|&id| id == ids[ti]).map(|c| c as u32))
+                .collect::<Option<_>>()?
+        } else {
+            Vec::new()
+        };
+        let head = focus_head.as_ref().map(|h| (h.as_slice(), classes.as_slice()));
         // the label is only broken out of in a CUDA build
         #[allow(unused_labels)]
         let (out_nll, out_argmax, out_dmask) = 'step: {
             #[cfg(feature = "cuda")]
             if crate::gpu::cuda_active() {
-                let o = fm.resident_step(ids, b, &ffn, &mats, &targets, inv_n as f32, want, ta)?;
+                let o = fm.resident_step(ids, b, &ffn, &mats, &targets, head, inv_n as f32, want, ta, self.lin)?;
+                if let (Some(cell), true) = (self.dlin, want) {
+                    let mut acc = cell.borrow_mut();
+                    for (dst, src) in acc.iter_mut().zip(&o.dlin) {
+                        for (d, &x) in dst.iter_mut().zip(src) {
+                            *d += x as f64;
+                        }
+                    }
+                }
                 break 'step (o.nll, o.argmax, o.dmask);
             }
-            let o = fm.resident_step_wgpu(ids, b, &ffn, &mats, &targets, inv_n as f32, want, ta)?;
+            if self.lin.is_some() {
+                // the output masks have the CUDA resident step only
+                return None;
+            }
+            let o = fm.resident_step_wgpu(ids, b, &ffn, &mats, &targets, head, inv_n as f32, want, ta)?;
             (o.nll, o.argmax, o.dmask)
         };
         let mut nll = 0f64;
@@ -841,6 +919,18 @@ impl Pass<'_> {
         let mut hits = Vec::with_capacity(if want_hits { scored } else { 0 });
         for (r, &ti) in targets.iter().enumerate() {
             nll += out_nll[r] as f64;
+            if focus {
+                if let Some(stats) = focus_stats.as_deref_mut() {
+                    let class = classes[r] as usize;
+                    stats.total += 1;
+                    stats.class_total[class] += 1;
+                    if out_argmax[r] == classes[r] {
+                        stats.correct += 1;
+                        stats.class_correct[class] += 1;
+                    }
+                }
+                continue;
+            }
             let ok = out_argmax[r] == ids[ti];
             if span_stats {
                 if let Some(stats) = focus_stats.as_deref_mut() {
@@ -1039,6 +1129,18 @@ impl Pass<'_> {
         )>,
         mut focus_stats: Option<&mut FocusStats>,
     ) -> (f64, usize) {
+        if self.lin.is_some() {
+            // the output masks live in the CUDA resident step only: never a
+            // silent layer-path pass that would score the model without them
+            #[cfg(feature = "gpu")]
+            {
+                let (mut grad, mut focus_stats) = (grad, focus_stats);
+                if let Some(r) = self.resident(ids, b, &mut grad, &mut focus_stats) {
+                    return r;
+                }
+            }
+            panic!("--mask-scope linear: the CUDA resident step declined this batch (it needs CMF_GPU=cuda, --through-attn and the card's memory)");
+        }
         #[cfg(feature = "gpu")]
         let mut grad = grad;
         #[cfg(feature = "gpu")]
@@ -2223,6 +2325,8 @@ pub fn replica_score_file_mask(
             soft_fold: false,
             attn_tr: &no_attn,
             through_attn: false,
+        lin: None,
+        dlin: None,
         };
         held_ppl(&pass, chunks)
     };
@@ -2302,6 +2406,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+        lin: None,
+        dlin: None,
         };
         let score = held_score(&pass, &held);
         let keep: Vec<Vec<bool>> = fm
@@ -2393,6 +2499,34 @@ pub fn skill_bake(
         }
         None => vec![vec![m0; inter]; vn],
     };
+    // `--mask-scope linear`: a gate per output row of every projection; the
+    // FFN neuron gates stay open (σ(50) is 1.0 in f32) and do not train.
+    let lin_on = hy.mask_linear;
+    let lin_mods: Vec<Vec<(String, usize)>> = if lin_on { (0..nl).map(|li| fm.lin_modules(li)).collect() } else { Vec::new() };
+    let mut lin_logits: Vec<Vec<f32>> = Vec::new();
+    if lin_on {
+        if loops > 1 || !hy.through_attn {
+            return Err("skill bake: --mask-scope linear needs --through-attn and a model without loops".into());
+        }
+        logits = vec![vec![50.0; inter]; vn];
+        lin_logits = match &hy.lin_logits {
+            Some(v) => {
+                if v.len() != nl || v.iter().zip(&lin_mods).any(|(row, m)| row.len() != m.iter().map(|x| x.1).sum::<usize>()) {
+                    return Err("skill bake: the supplied linear_logits do not fit this model's projections".into());
+                }
+                log(&format!("linear masks: resuming from {} supplied layers", v.len()));
+                v.clone()
+            }
+            None => lin_mods.iter().map(|m| vec![hy.mask_init; m.iter().map(|x| x.1).sum()]).collect(),
+        };
+        let n_gates: usize = lin_logits.iter().map(Vec::len).sum();
+        log(&format!(
+            "linear masks: {n_gates} gates over {} projections in {nl} layers (FFN neuron gates open)",
+            lin_mods.iter().map(Vec::len).sum::<usize>()
+        ));
+    }
+    let gains_of = |v: &[Vec<f32>]| -> Vec<Vec<f32>> { v.iter().map(|r| r.iter().map(|&x| sigmoid(x)).collect()).collect() };
+    let mut lin_gains: Option<Vec<Vec<f32>>> = lin_on.then(|| gains_of(&lin_logits));
     let mut ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
 
     // Baseline (no mask): even σ(m0) is not exactly 1, so measure with
@@ -2410,6 +2544,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+    lin: None,
+    dlin: None,
     };
     // CMF_BAKE_SKIP_BASELINE=1 with a supplied mask: a checkpoint
     // measurement that already knows the backbone's score skips its pass.
@@ -2437,7 +2573,7 @@ pub fn skill_bake(
     }
     // A resumed mask is scored before it trains on: the run's own start,
     // and with --steps-a 0 a held-out measurement of any checkpoint.
-    if hy.mask_logits.is_some() {
+    if hy.mask_logits.is_some() || hy.lin_logits.is_some() {
         let start_pass = Pass {
             fm: &fm,
             tau: hy.tau,
@@ -2450,6 +2586,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+        lin: lin_gains.as_deref(),
+        dlin: None,
         };
         let s0 = held_score_tagged(&start_pass, &held, held_tags.as_ref());
         log(&format!("supplied mask: {:.3}{}", s0.ppl, score_suffix(&s0)));
@@ -2460,6 +2598,8 @@ pub fn skill_bake(
 
     // ── Phase A: mask training ──
     let mut adam_a = Adam::new(&vec![inter; vn], hy.lr_a);
+    let mut adam_lin = Adam::new(&lin_logits.iter().map(Vec::len).collect::<Vec<_>>(), hy.lr_a);
+    let mut best_lin: Option<Vec<Vec<f32>>> = None;
     let mut l1 = hy.l1_init * hy.l1_mult;
     let l1_step_eff = hy.l1_step * hy.l1_mult;
     // best = (ppl, logits_snapshot, sparsity)
@@ -2498,6 +2638,7 @@ pub fn skill_bake(
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = vec![None; nl];
         let mut dattn: Vec<Option<AttnGrads>> = (0..nl).map(|_| None).collect();
+        let dlin_cell = std::cell::RefCell::new(lin_logits.iter().map(|r| vec![0f64; r.len()]).collect::<Vec<_>>());
         let pass = Pass {
             fm: &fm,
             tau: hy.tau,
@@ -2510,8 +2651,33 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+        lin: lin_gains.as_deref(),
+        dlin: lin_on.then_some(&dlin_cell),
         };
         let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn, &mut dattn)));
+        drop(pass);
+        if lin_on {
+            // σ'(m) and the notebooks' sparsity term: λ · mean over the
+            // projections of each projection's mean gate (q, k and v count
+            // as three, as their three Linears do)
+            let mut dl = dlin_cell.into_inner();
+            let n_mod: usize = lin_mods.iter().map(Vec::len).sum();
+            for (li, mods) in lin_mods.iter().enumerate() {
+                let mut at = 0usize;
+                for (_, rows) in mods {
+                    let l1_per = hy.lin_l1 / (n_mod as f64 * *rows as f64);
+                    for j in at..at + rows {
+                        let sg = sigmoid(lin_logits[li][j]) as f64;
+                        let ds = sg * (1.0 - sg);
+                        dl[li][j] = dl[li][j] * ds + l1_per * ds;
+                    }
+                    at += rows;
+                }
+            }
+            let mut params: Vec<&mut [f32]> = lin_logits.iter_mut().map(|v| v.as_mut_slice()).collect();
+            adam_lin.step_clip(&mut params, &dl, 1.0, None);
+            lin_gains = Some(gains_of(&lin_logits));
+        }
         // Fold σ'(m) into the mask grads + add the L1 term.
         let l1_per = l1 / (inter as f64 * nl as f64);
         for li in 0..vn {
@@ -2534,8 +2700,10 @@ pub fn skill_bake(
         // scale now belongs to Phase B alone, where the FFN weights ARE
         // shared across visits.
         let t_chunk = t_step.elapsed().as_secs_f64();
-        let mut params: Vec<&mut [f32]> = logits.iter_mut().map(|v| v.as_mut_slice()).collect();
-        adam_a.step(&mut params, &dmask, 1.0);
+        if !lin_on {
+            let mut params: Vec<&mut [f32]> = logits.iter_mut().map(|v| v.as_mut_slice()).collect();
+            adam_a.step(&mut params, &dmask, 1.0);
+        }
         acc_chunk += t_chunk;
         acc_adam += t_step.elapsed().as_secs_f64() - t_chunk;
         if (step + 1) % hy.eval_every == 0 {
@@ -2552,6 +2720,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+            lin: lin_gains.as_deref(),
+            dlin: None,
             };
             crate::gpu::bake_precision_strict(false);
             let hs = held_score_tagged(&pass, &held, held_tags.as_ref());
@@ -2617,6 +2787,8 @@ pub fn skill_bake(
                     "token_accuracy": hs.token_accuracy,
                     "per_tag": hs.per_tag,
                     "selected_logits": &logits,
+                    "linear_logits": lin_on.then_some(&lin_logits),
+                    "linear_modules": lin_on.then(|| lin_mods.iter().map(|m| m.iter().map(|(n, r)| serde_json::json!([n, r])).collect::<Vec<_>>()).collect::<Vec<_>>()),
                 });
                 let path = format!("{dir}/phase-a-step-{}.json", step + 1);
                 match serde_json::to_vec(&doc) {
@@ -2677,6 +2849,9 @@ pub fn skill_bake(
             } else if eligible && hp < best.0 {
                 best = (hp, Some(logits.clone()), sp);
                 best_step = step + 1;
+            }
+            if lin_on && best_step == step + 1 {
+                best_lin = Some(lin_logits.clone());
             }
             log(&format!(
                 "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3}{} (bottom {}@{:.2}%) [fwd+bwd {:.2}s, adam {:.2}s per step]",
@@ -2753,6 +2928,10 @@ pub fn skill_bake(
     if let Some(b) = best.1.take() {
         logits = b;
     }
+    if let Some(bl) = best_lin.take() {
+        lin_logits = bl;
+        lin_gains = Some(gains_of(&lin_logits));
+    }
     let pass = Pass {
         fm: &fm,
         tau: hy.tau,
@@ -2765,6 +2944,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+    lin: lin_gains.as_deref(),
+    dlin: None,
     };
     // With no mask-training steps the hard mask is still exactly all-open,
     // so rescoring the same validation batch is pure duplicate work.  This
@@ -2852,6 +3033,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+        lin: lin_gains.as_deref(),
+        dlin: None,
         };
         log(&format!(
             "[B-cache] extracting native CMF boundaries: {} train + {} held records",
@@ -2991,6 +3174,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+            lin: lin_gains.as_deref(),
+            dlin: None,
             };
             let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn, &mut dattn)));
             // Cosine LR.
@@ -3049,6 +3234,8 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
             through_attn: hy.through_attn,
+                lin: lin_gains.as_deref(),
+                dlin: None,
                 };
                 let cur = held_score_tagged(&pass, &held, held_tags.as_ref());
                 let better = if hy.checkpoint_accuracy && hy.answer_span.is_some() {
