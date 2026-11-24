@@ -84,6 +84,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the backward replays it) instead of the host's f64 recurrence — the layer path's step with `--through-attn`
   5.3 → 1.7 s on Qwen3.5-0.8B, the same held-out PPL as CPU and CUDA.
 
+- `skill bake --focus-tokens` (the exact classifier) on the resident step: the head is the class rows only and
+  each target its class, the layer path's class-row softmax; it ran the layer path before (RTX 3060, Qwen3.5-0.8B,
+  8 records of ~240 tokens: 5.35 s a step). The resident step against the layer path (`CMF_BAKE_RES_CHECK=1`): the
+  loss to 1e-5, the mask gradient to 2.5e-5.
+- `skill bake` on CUDA: a GDN layer's backward runs the NVG trainer's operator (the states at chunk starts, the
+  reverse sweep as batched products over chunks) instead of the bake's per-position BPTT, which kept every state
+  of every position — 1.55 s of a 2.1 s step at 8 × ~280 tokens; the step 2.14 → 1.01 s. The states at chunk
+  starts are f16, so the mask gradient moves by 2.5e-4 against the layer path; `CMF_BAKE_GDN_NVG=0` keeps the
+  per-position kernel. `CMF_BAKE_RES_PROF=1` prints the CUDA step's sections too.
+- `serve`: `cortiq.class_tokens` scores through generation's own prompt path (the batched prefill, the device
+  graphs; `Pipeline::prompt_next_logits`) instead of walking the prompt a position at a time — Qwen3.5-0.8B on
+  CUDA, 231-token prompts: 1.4 → 23.6 requests/s, the same labels on 150 of 150 (probabilities within 0.024, the
+  q8 codec's prefill against its decode path).
+
 ### Fixed
 - `skill bake --through-attn` on Vulkan: the wgpu `gemm_dx` wrote its product over dX where the contract (and the
   CPU and CUDA twins) is dX += dY·W, so a GDN layer's four projections kept only the last one's gradient

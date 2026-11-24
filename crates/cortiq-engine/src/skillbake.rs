@@ -532,6 +532,31 @@ fn is_scored_target(
             || (target_index + 1 < sequence_end && follow.contains(&ids[target_index + 1])))
 }
 
+/// The class rows of the LM head for the resident exact classifier, built
+/// once per (head, classes) and kept: the card's weight caches key on the
+/// buffer, so a fresh Vec per step would upload it again every step.
+#[cfg(feature = "gpu")]
+fn focus_head(fm: &crate::fcd::FcdModel, focus: &[u32]) -> std::sync::Arc<Vec<f32>> {
+    type Key = (usize, Vec<u32>);
+    static CACHE: std::sync::Mutex<Option<(Key, std::sync::Arc<Vec<f32>>)>> = std::sync::Mutex::new(None);
+    let lm: &[f32] = fm.lm_head.as_deref().unwrap_or(&fm.embed);
+    let key = (lm.as_ptr() as usize, focus.to_vec());
+    let mut c = CACHE.lock().unwrap();
+    if let Some((k, h)) = c.as_ref() {
+        if *k == key {
+            return h.clone();
+        }
+    }
+    let hsz = fm.hidden;
+    let mut rows = Vec::with_capacity(focus.len() * hsz);
+    for &id in focus {
+        rows.extend_from_slice(&lm[id as usize * hsz..(id as usize + 1) * hsz]);
+    }
+    let h = std::sync::Arc::new(rows);
+    *c = Some((key, h.clone()));
+    h
+}
+
 #[cfg(feature = "gpu")]
 thread_local! {
     /// Set while the resident check runs the layer path on the same batch.
@@ -805,7 +830,7 @@ impl Pass<'_> {
         focus_stats: &mut Option<&mut FocusStats>,
     ) -> Option<(f64, usize)> {
         let fm = self.fm;
-        if !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) || !self.focus_tokens.is_empty() || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
+        if !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
             return None;
         }
         if self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
@@ -824,15 +849,28 @@ impl Pass<'_> {
         let scored = targets.len();
         let inv_n = 1.0 / scored as f64;
         let (want, ta) = (grad.is_some(), self.through_attn);
+        // The exact classifier (`--focus-tokens`): the head is the class rows
+        // only, each target its class — the layer path's class-row softmax.
+        let focus = !self.focus_tokens.is_empty();
+        let focus_head = focus.then(|| focus_head(fm, self.focus_tokens));
+        let classes: Vec<u32> = if focus {
+            targets
+                .iter()
+                .map(|&ti| self.focus_tokens.iter().position(|&id| id == ids[ti]).map(|c| c as u32))
+                .collect::<Option<_>>()?
+        } else {
+            Vec::new()
+        };
+        let head = focus_head.as_ref().map(|h| (h.as_slice(), classes.as_slice()));
         // the label is only broken out of in a CUDA build
         #[allow(unused_labels)]
         let (out_nll, out_argmax, out_dmask) = 'step: {
             #[cfg(feature = "cuda")]
             if crate::gpu::cuda_active() {
-                let o = fm.resident_step(ids, b, &ffn, &mats, &targets, inv_n as f32, want, ta)?;
+                let o = fm.resident_step(ids, b, &ffn, &mats, &targets, head, inv_n as f32, want, ta)?;
                 break 'step (o.nll, o.argmax, o.dmask);
             }
-            let o = fm.resident_step_wgpu(ids, b, &ffn, &mats, &targets, inv_n as f32, want, ta)?;
+            let o = fm.resident_step_wgpu(ids, b, &ffn, &mats, &targets, head, inv_n as f32, want, ta)?;
             (o.nll, o.argmax, o.dmask)
         };
         let mut nll = 0f64;
@@ -841,6 +879,18 @@ impl Pass<'_> {
         let mut hits = Vec::with_capacity(if want_hits { scored } else { 0 });
         for (r, &ti) in targets.iter().enumerate() {
             nll += out_nll[r] as f64;
+            if focus {
+                if let Some(stats) = focus_stats.as_deref_mut() {
+                    let class = classes[r] as usize;
+                    stats.total += 1;
+                    stats.class_total[class] += 1;
+                    if out_argmax[r] == classes[r] {
+                        stats.correct += 1;
+                        stats.class_correct[class] += 1;
+                    }
+                }
+                continue;
+            }
             let ok = out_argmax[r] == ids[ti];
             if span_stats {
                 if let Some(stats) = focus_stats.as_deref_mut() {

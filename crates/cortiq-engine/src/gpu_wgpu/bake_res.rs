@@ -78,6 +78,9 @@ pub struct WgStep<'a> {
     pub lm: &'a [f32],
     /// Scored target rows (the token predicted from row − 1).
     pub targets: &'a [usize],
+    /// The exact classifier: `lm` holds only the class rows and this is each
+    /// target's class (`gpu_cuda::BkStep::classes`).
+    pub classes: Option<&'a [u32]>,
     pub scale: f32,
     pub grad: bool,
     pub through_attn: bool,
@@ -1005,8 +1008,11 @@ pub fn phase_a(st: &WgStep) -> Option<WgOut> {
         return None;
     }
     let vocab = st.lm.len() / hsz;
+    let target_of = |k: usize| -> usize { st.classes.map_or(st.ids[st.targets[k]] as usize, |c| c[k] as usize) };
     if vocab % 4 != 0
-        || st.targets.iter().any(|&r| r == 0 || r >= n || st.ids[r] as usize >= vocab)
+        || st.classes.is_some_and(|c| c.len() != st.targets.len())
+        || st.targets.iter().any(|&r| r == 0 || r >= n)
+        || (0..st.targets.len()).any(|k| target_of(k) >= vocab)
         || st.ids.iter().any(|&i| (i as usize + 1) * hsz > st.embed.len())
     {
         return None;
@@ -1143,7 +1149,7 @@ fn run(st: &WgStep, c: &Ctx, s: &mut State, nt_p: &wgpu::ComputePipeline, nn_p: 
         }
     }
     let src_rows: Vec<u32> = st.targets.iter().map(|&r| (r - 1) as u32).collect();
-    let tgt: Vec<u32> = st.targets.iter().map(|&r| st.ids[r]).collect();
+    let tgt: Vec<u32> = (0..k).map(|i| st.classes.map_or(st.ids[st.targets[i]], |c| c[i])).collect();
     let rows_b = s.buf(c, "rows", k);
     c.queue.write_buffer(&rows_b, 0, bytemuck::cast_slice(&src_rows));
     let tgt_b = s.buf(c, "tgt", k);

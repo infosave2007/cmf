@@ -883,6 +883,11 @@ pub struct BkStep<'a> {
     pub lm: &'a [f32],
     /// Scored target rows (the token predicted from row − 1).
     pub targets: &'a [usize],
+    /// The exact classifier (`--focus-tokens`): `lm` holds only the class
+    /// rows, and this is each target's class (a row of `lm`); the
+    /// cross-entropy and argmax are over the classes. None: the targets are
+    /// the token ids and `lm` the whole head.
+    pub classes: Option<&'a [u32]>,
     pub scale: f32,
     pub grad: bool,
     /// The backward also runs through every frozen attention (and GDN)
@@ -1024,20 +1029,19 @@ unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x
 /// recomputed from `x`; then out_proj's transpose, the recurrence's BPTT,
 /// the conv's backward and the projections' transpose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn gdn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &BakeGdnW, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize) -> Res<()> {
+unsafe fn gdn_bwd_dev(c: &'static Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &BakeGdnW, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize) -> Res<()> {
     let (n, cdim, vd, nv) = (b * t, g.c_dim(), g.nv * g.dv, g.nv);
     let mode = gemm_mode();
     let (wq, wz, wa, wb, wo) = (s.weight(w.wqkv)?, s.weight(w.wz)?, s.weight(w.wa)?, s.weight(w.wb)?, s.weight(w.wout)?);
     let (qkv, z, a, bb) = (s.scr("qkv", n * cdim * 4)?, s.scr("z", n * vd * 4)?, s.scr("a", n * nv * 4)?, s.scr("b", n * nv * 4)?);
     let (taps, alog, dtb, nw) = (s.up(c, "taps", g.conv)?, s.up(c, "alog", g.a_log)?, s.up(c, "dtb", g.dt_bias)?, s.up(c, "nw", g.norm)?);
-    let (pre, cq) = (s.scr("pre", n * cdim * 4)?, s.scr("cq", n * cdim * 4)?);
     let dof = s.scr("bdof", n * vd * 4)?;
-    let (dcq, draw) = (s.scr("bdcq", n * cdim * 4)?, s.scr("bdraw", n * cdim * 4)?);
+    let draw = s.scr("bdraw", n * cdim * 4)?;
     let (dz, da, db) = (s.scr("bdz", n * vd * 4)?, s.scr("bda", n * nv * 4)?, s.scr("bdb", n * nv * 4)?);
-    let per = seqs_per_launch(g, t, b);
-    let hist = s.scr("bhist", per * g.nv * (t + 1) * g.dk * g.dv * 4)?;
-    let kvh = s.scr("bkvh", per * g.nv * t * g.dv * 4)?;
-    let oh = s.scr("boh", per * g.nv * t * g.dv * 4)?;
+    // The NVG trainer's operator (states at chunk starts, the chunked reverse
+    // sweep) for 128-wide heads; `CMF_BAKE_GDN_NVG=0` keeps the bake's own
+    // per-position BPTT below.
+    let nvg = g.dk == 128 && g.dv == 128 && std::env::var("CMF_BAKE_GDN_NVG").as_deref() != Ok("0");
     let (n_i, t_i, cd_i, kk_i, nv_i, nk_i) = (n as i32, t as i32, cdim as i32, g.kk as i32, nv as i32, g.nk as i32);
     let eps = g.eps;
     let tot = (n * cdim) as u64;
@@ -1046,18 +1050,28 @@ unsafe fn gdn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &Ba
         c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, x, hsz, 0.0, z, vd, mode)?;
         c.gemm(true, false, nv, n, hsz, 1.0, wa, hsz, x, hsz, 0.0, a, nv, Gemm::F32)?;
         c.gemm(true, false, nv, n, hsz, 1.0, wb, hsz, x, hsz, 0.0, bb, nv, Gemm::F32)?;
-        c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
         // dof = dy·Wout
         c.gemm(false, false, vd, n, hsz, 1.0, wo, vd, dy, hsz, 0.0, dof, vd, mode)?;
-        cu::memset_d8_async(dcq, 0, n * cdim * 4, c.stream).map_err(derr)?;
-        let mut s0 = 0usize;
-        while s0 < b {
-            let nb = per.min(b - s0);
-            let seq0 = s0 as i32;
-            c.launch(f.gdn_bwd, (nv as u32, nb as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, dof, dcq, dz, da, db, hist, kvh, oh, t_i, nv_i, nk_i, eps, seq0))?;
-            s0 += nb;
+        if nvg {
+            super::nvgt::bake_gdn_bwd(c, (b, t, nv, g.nk, g.kk, eps), [alog, dtb, nw, taps], qkv, z, a, bb, dof, draw, dz, da, db).map_err(|e| format!("nvg gdn: {e}"))?;
+        } else {
+            let (pre, cq) = (s.scr("pre", n * cdim * 4)?, s.scr("cq", n * cdim * 4)?);
+            let dcq = s.scr("bdcq", n * cdim * 4)?;
+            let per = seqs_per_launch(g, t, b);
+            let hist = s.scr("bhist", per * g.nv * (t + 1) * g.dk * g.dv * 4)?;
+            let kvh = s.scr("bkvh", per * g.nv * t * g.dv * 4)?;
+            let oh = s.scr("boh", per * g.nv * t * g.dv * 4)?;
+            c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
+            cu::memset_d8_async(dcq, 0, n * cdim * 4, c.stream).map_err(derr)?;
+            let mut s0 = 0usize;
+            while s0 < b {
+                let nb = per.min(b - s0);
+                let seq0 = s0 as i32;
+                c.launch(f.gdn_bwd, (nv as u32, nb as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, dof, dcq, dz, da, db, hist, kvh, oh, t_i, nv_i, nk_i, eps, seq0))?;
+                s0 += nb;
+            }
+            c.launch(f.conv_bwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pre, dcq, taps, draw, n_i, t_i, cd_i, kk_i))?;
         }
-        c.launch(f.conv_bwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pre, dcq, taps, draw, n_i, t_i, cd_i, kk_i))?;
         // dx = draw·Wqkv + dz·Wz + da·Wa + db·Wb
         c.gemm(false, false, hsz, n, cdim, 1.0, wq, hsz, draw, cdim, 0.0, dx, hsz, mode)?;
         c.gemm(false, false, hsz, n, vd, 1.0, wz, hsz, dz, vd, 1.0, dx, hsz, mode)?;
@@ -1065,6 +1079,44 @@ unsafe fn gdn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &Ba
         c.gemm(false, false, hsz, n, nv, 1.0, wb, hsz, db, nv, 1.0, dx, hsz, Gemm::F32)?;
     }
     Ok(())
+}
+
+/// `CMF_BAKE_RES_PROF=1`: the step synchronizes after each section and
+/// prints the wall time per section (the syncs remove the overlap between
+/// sections, so the sum runs a little over the plain step).
+struct StepProf {
+    on: bool,
+    t: std::time::Instant,
+    secs: Vec<(&'static str, f64)>,
+}
+
+impl StepProf {
+    fn new() -> Self {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("CMF_BAKE_RES_PROF").as_deref() == Ok("1"));
+        Self { on, t: std::time::Instant::now(), secs: Vec::new() }
+    }
+
+    fn mark(&mut self, c: &Ctx, name: &'static str) {
+        if !self.on {
+            return;
+        }
+        let _ = c.sync();
+        let dt = self.t.elapsed().as_secs_f64() * 1e3;
+        match self.secs.iter_mut().find(|(n, _)| *n == name) {
+            Some(x) => x.1 += dt,
+            None => self.secs.push((name, dt)),
+        }
+        self.t = std::time::Instant::now();
+    }
+
+    fn report(&self) {
+        if self.on {
+            let total: f64 = self.secs.iter().map(|x| x.1).sum();
+            let parts: Vec<String> = self.secs.iter().map(|(n, ms)| format!("{n} {ms:.1}")).collect();
+            eprintln!("[bake-res-prof cuda] {total:.1} ms: {}", parts.join(" | "));
+        }
+    }
 }
 
 /// A whole Phase-A step of the skill bake on the card: embeddings, every
@@ -1083,12 +1135,17 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
         return None;
     }
     let vocab = st.lm.len() / hsz;
-    if st.ids.iter().any(|&i| i as usize >= st.embed.len() / hsz) || st.targets.iter().any(|&r| st.ids[r] as usize >= vocab) {
+    let target_of = |k: usize| -> usize { st.classes.map_or(st.ids[st.targets[k]] as usize, |c| c[k] as usize) };
+    if st.ids.iter().any(|&i| i as usize >= st.embed.len() / hsz)
+        || st.classes.is_some_and(|c| c.len() != st.targets.len())
+        || (0..st.targets.len()).any(|k| target_of(k) >= vocab)
+    {
         return None;
     }
     let _g = c.st.lock().unwrap();
     let mut gs = STATE.lock().unwrap();
     let s = gs.get_or_insert_with(BkState::default);
+    let mut prof = StepProf::new();
     let mut run = || -> Res<BkOut> {
         let gdn_dims = st.layers.iter().find_map(|l| match &l.attn {
             BkAttn::Gdn(g, _) => Some((g.dk, g.dv)),
@@ -1168,8 +1225,12 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                         c.launch(f.gdn_fwd, (nv as u32, b as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, of, t_i, nv_i, nk_i, geps, seq0))?;
                         c.gemm(true, false, hsz, n, vd, 1.0, wo, vd, of, vd, 0.0, ao, hsz, mode)?;
                     }
+                    prof.mark(c, "fwd.gdn");
                 }
-                BkAttn::Full(fa) => unsafe { full_attn_dev(c, s, &f, fa, nrm, ao, b, t, hsz, eps, st.gemma)? },
+                BkAttn::Full(fa) => {
+                    unsafe { full_attn_dev(c, s, &f, fa, nrm, ao, b, t, hsz, eps, st.gemma)? };
+                    prof.mark(c, "fwd.full");
+                }
             }
             let inter = l.inter;
             let wgu = s.weight(l.gu)?;
@@ -1186,13 +1247,14 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                 c.gemm(true, false, hsz, n, inter, 1.0, wdn, inter, act, inter, 0.0, ao, hsz, mode)?;
                 c.launch(f.add, gh, 256, 0, kargs!(h1, ao, h, tot_h))?;
             }
+            prof.mark(c, "fwd.ffn");
         }
         // final norm, the scored rows' cross-entropy
         let fnw = s.up(c, "rfn", st.final_norm)?;
         let finv = s.scr("rfinv", n * 4)?;
         let k = st.targets.len();
         let src: Vec<i32> = st.targets.iter().map(|&r| (r - 1) as i32).collect();
-        let tg: Vec<i32> = st.targets.iter().map(|&r| st.ids[r] as i32).collect();
+        let tg: Vec<i32> = (0..k).map(|i| target_of(i) as i32).collect();
         let (srcb, tgb) = (Buf::from_slice(&src)?, Buf::from_slice(&tg)?);
         let hs = s.scr("rhs", k * hsz * 4)?;
         let band = ((512usize << 20) / (vocab * 4)).clamp(1, k);
@@ -1221,6 +1283,7 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
         let nl_v = dtoh(c, nll, k)?;
         let mut am = vec![0i32; k];
         unsafe { cu::memcpy_dtoh_async(am.as_mut_slice(), arg, c.stream).map_err(derr)? };
+        prof.mark(c, "head");
         let mut dmask = Vec::new();
         if st.grad {
             // dhn (scattered) → dh through the final norm
@@ -1257,6 +1320,7 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                     // straight to dh_in
                     c.launch(f.rmsnorm_bwd, (n as u32, 1), 256, 0, kargs!(h1, pln, inv2, dn2, dh, hsz_i, gm, acc))?;
                 }
+                prof.mark(c, "bwd.ffn");
                 if st.through_attn {
                     // dh_in = dh1 + input-norm backward of the branch's dX
                     let hin = s.saves_in[li].ptr;
@@ -1270,15 +1334,19 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                         }
                         c.launch(f.rmsnorm_bwd, (n as u32, 1), 256, 0, kargs!(hin, iln, inv1, dn1, dh, hsz_i, gm, acc))?;
                     }
+                    prof.mark(c, if matches!(l.attn, BkAttn::Full(_)) { "bwd.full" } else { "bwd.gdn" });
                 }
             }
             let all = dtoh(c, dm, nl * max_inter)?;
             dmask = st.layers.iter().enumerate().map(|(li, l)| all[li * max_inter..li * max_inter + l.inter].to_vec()).collect();
         }
         c.sync()?;
+        prof.mark(c, "readback");
         Ok(BkOut { nll: nl_v, argmax: am.into_iter().map(|a| a as u32).collect(), dmask })
     };
-    match run() {
+    let res = run();
+    prof.report();
+    match res {
         Ok(o) => Some(o),
         Err(e) => {
             let _ = c.sync();

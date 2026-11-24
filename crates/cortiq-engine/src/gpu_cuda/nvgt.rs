@@ -169,7 +169,8 @@ fn build(c: &Ctx) -> Res<F> {
 struct Dev {
     c: &'static Ctx,
     f: F,
-    _g: std::sync::MutexGuard<'static, State>,
+    /// None: the caller already holds the context's lock (`bake_gdn_bwd`).
+    _g: Option<std::sync::MutexGuard<'static, State>>,
 }
 
 fn enter() -> Result<Dev, String> {
@@ -178,7 +179,7 @@ fn enter() -> Result<Dev, String> {
     c.current()?;
     let mut fg = FUNCS.lock().unwrap();
     let f = fg.get_or_insert_with(|| FBox(build(c))).0.clone()?;
-    Ok(Dev { c, f, _g: g })
+    Ok(Dev { c, f, _g: Some(g) })
 }
 
 /// The card is up and the trainer's kernels compile on it.
@@ -1832,6 +1833,88 @@ fn gdn_chunk(t: usize) -> Option<usize> {
 
 /// The largest chunk (`GDC_MAX` of nvgt.cu).
 const GDC_MAX: usize = 256;
+
+/// A GDN layer's backward for the skill bake's resident step
+/// (`bake::gdn_bwd_dev`) on this module's operator: the forward keeping the
+/// states at chunk starts, then the chunked reverse sweep. The bake's own
+/// per-position BPTT keeps every state of every position (`(t+1)·dk·dv` floats
+/// a v-head) and was 1.55 s of a 2.1 s Qwen3.5-0.8B step at 8 × 288 tokens.
+/// The caller holds the context's lock and passes addresses on its stream;
+/// `raw` is the qkv projection before the conv, `prm` = (a_log, dt_bias,
+/// norm, conv). The scratch stays here, rebuilt when the geometry changes.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn bake_gdn_bwd(
+    c: &'static Ctx,
+    geom: (usize, usize, usize, usize, usize, f32),
+    prm: [u64; 4],
+    raw: u64,
+    z: u64,
+    a: u64,
+    b: u64,
+    dout: u64,
+    draw: u64,
+    dz: u64,
+    da: u64,
+    db: u64,
+) -> Res<()> {
+    let (nb, t, nv, nk, kk, eps) = geom;
+    let f = FUNCS.lock().unwrap().get_or_insert_with(|| FBox(build(c))).0.clone()?;
+    let d = Dev { c, f, _g: None };
+    let g = GdnG { nb, t, nv, nk, kk, eps };
+    let p = GdnP { a_log: prm[0], dt_bias: prm[1], norm: prm[2], conv: prm[3] };
+    static WORK: Mutex<Option<BakeGdnWork>> = Mutex::new(None);
+    let mut wk = WORK.lock().unwrap();
+    if wk.as_ref().is_none_or(|w| w.key != (nb, t, nv, nk)) {
+        drop(wk.take());
+        *wk = Some(BakeGdnWork::new(c, (nb, t, nv, nk))?);
+    }
+    let w = wk.as_ref().expect("built above");
+    let sc = GdnS { dcq: w.dcq.ptr, dqk: w.dqk.ptr, hist: w.hist.ptr, kvh: w.kvh.ptr, oh: w.oh.ptr, per: nb, chunk: w.chunk.as_ref() };
+    unsafe {
+        gdn_core_fwd(&d, g, p, raw, z, a, b, w.pre.ptr, w.cq.ptr, w.out.ptr, Some(&sc))?;
+        gdn_core_bwd(&d, g, p, z, a, b, w.pre.ptr, w.cq.ptr, dout, draw, dz, da, db, &sc, true)
+    }
+}
+
+/// `bake_gdn_bwd`'s scratch for (sequences, positions, v-heads, k-heads), as
+/// `Work::new` sizes the trainer's with every sequence in one launch.
+struct BakeGdnWork {
+    key: (usize, usize, usize, usize),
+    pre: DBuf,
+    cq: DBuf,
+    out: DBuf,
+    dcq: DBuf,
+    dqk: DBuf,
+    hist: DBuf,
+    kvh: DBuf,
+    oh: DBuf,
+    chunk: Option<GdnC>,
+}
+
+impl BakeGdnWork {
+    fn new(c: &Ctx, key: (usize, usize, usize, usize)) -> Res<Self> {
+        let (nb, t, nv, nk) = key;
+        let n = nb * t;
+        let (vd, cd) = (nv * DKV, 2 * nk * DKV + nv * DKV);
+        let chunk = gdn_chunk(t);
+        let stride = chunk.unwrap_or(2).max(1);
+        Ok(Self {
+            key,
+            pre: DBuf::floats(c, n * cd)?,
+            cq: DBuf::floats(c, n * cd)?,
+            out: DBuf::floats(c, n * vd)?,
+            dcq: DBuf::floats(c, n * cd)?,
+            dqk: DBuf::floats(c, n * nv * 2 * DKV)?,
+            hist: DBuf::floats(c, (nb * nv * t.div_ceil(stride) * DKV * DKV).div_ceil(2))?,
+            kvh: DBuf::floats(c, nb * nv * t * DKV)?,
+            oh: DBuf::floats(c, nb * nv * t * DKV)?,
+            chunk: match chunk {
+                Some(cap) => Some(GdnC::new(c, nb * nv, cap)?),
+                None => None,
+            },
+        })
+    }
+}
 
 /// Scratch of the chunked reverse sweep (`nt_gdc_*`): per unit — one
 /// sequence's v-head — the chunk's `[C][D]` rows, `[C][C]` factors, `[D][D]`
