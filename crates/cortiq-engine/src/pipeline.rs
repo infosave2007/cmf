@@ -669,6 +669,10 @@ pub struct Pipeline {
     /// token). On by default; `bench --core` turns it off to match
     /// llama-bench's core timing.
     confidence_on: bool,
+    /// `prompt_next_logits`: keep the first decode step's logits (the
+    /// next-token logits after the prompt) in `first_logits`.
+    want_first_logits: bool,
+    first_logits: Option<Vec<f32>>,
     /// Test-only one-shot forward failure, scoped to this pipeline so
     /// parallel scoring tests cannot consume one another's injection.
     #[cfg(test)]
@@ -5013,6 +5017,8 @@ impl Pipeline {
             trace: false,
             calib_temp: 1.0,
             confidence_on: true,
+            want_first_logits: false,
+            first_logits: None,
             embed_multiplier: 1.0,
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             swa: None,
@@ -8717,6 +8723,9 @@ impl Pipeline {
                         return Err(format!("logit dump write failed: {e}"));
                     }
                 }
+            }
+            if generated == 0 && self.want_first_logits {
+                self.first_logits = Some(logits.clone());
             }
             // CMF_LOGIT_DUMP_ALL=<dir>: every decode step's logits as raw
             // f32, `<dir>/step{n:05}.f32` — step-by-step backend diffing
@@ -24269,6 +24278,23 @@ impl Pipeline {
                 *v += add;
             }
         }
+    }
+
+    /// The next-token logits after `ids` through generation's own prompt path
+    /// (the batched prefill, the device graphs): one generation step whose
+    /// token is discarded, on a fresh sequence as `prefill_next_logits` —
+    /// which walks the prompt a position at a time and stays the reference.
+    /// The classification endpoint scores with this: a 231-token prompt of
+    /// Qwen3.5-0.8B on CUDA took 0.69 s through the per-position walk, a
+    /// one-token generation 0.04 s.
+    pub fn prompt_next_logits(&mut self, ids: &[u32], task_mask: Option<&TaskMask>) -> Result<Vec<f32>, String> {
+        self.clear_sequence_state();
+        self.want_first_logits = true;
+        self.first_logits = None;
+        let out = self.generate_from_ids(ids, 1, task_mask, None);
+        self.want_first_logits = false;
+        out?;
+        self.first_logits.take().ok_or_else(|| "generation produced no first-step logits".to_string())
     }
 
     /// Prefill `ids` and return the next-token logits — what the model
