@@ -42,6 +42,35 @@ only. It is not a trading strategy.
 - **Class mix.** The later period is calmer: 63–72 % of test hours are LOW against 50 % in train. Read the balanced
   accuracy.
 
+## The skill file, and LoRA on the same budget
+
+`skill export --gains-from` stores a soft-folded skill as one f32 gain per FFN neuron of each changed
+`down_proj`; `skill apply` rebuilds the tensors from the base byte for byte. A LoRA was trained against it on
+the same card with the same budget (`lora_bench.py`): the same balanced records in the same order, 750 steps
+of 8, the same exact-classifier loss (cross-entropy over the two class tokens at the answer position), the
+checkpoint with the best accuracy on the same 480 held records, the test set once. PEFT, rank 16 on every
+linear layer of the language model, bf16 weights, adapter in f32, AdamW lr 2e-4 (torch 2.15, the
+flash-linear-attention kernels for GDN).
+
+| | cortiq skill (gains) | LoRA r=16 |
+|---|---:|---:|
+| file | 0.378 MB | 43.3 MB |
+| trained parameters | 86 016 gains | 10 822 656 |
+| `range` test: acc / balanced / 20 % most confident | 75.6 / 70.7 / 92.2 | 74.7 / 71.3 / 91.5 |
+| `dir` test: acc / balanced | 50.8 / 50.8 | 51.0 / 50.5 |
+| training, 750 steps, RTX 3060 (fwd + bwd + update) | 765 s (1.02 s/step); 428 s (0.57 s/step) with `CMF_BAKE_RES_BF16=1` | 461 s (0.62 s/step) |
+
+A logistic regression on the prompt's features reaches 76.3 / 71.7 / 90.8 on `range`: neither adapter beats
+the classical model, and neither finds a direction signal.
+
+The bake's default step is strict f32 (no tensor cores); `CMF_BAKE_RES_BF16=1` puts its weight products on bf16
+operands, as LoRA's autocast does. The `range` bake with it reached 68.75 % on the held records (68.54 % in f32)
+in 622 s instead of 1043 s. The published skills and the test numbers above are the f32 ones.
+
+![Held accuracy by step](figures/held_accuracy_by_step.png)
+
+![Accuracy against the share of the most confident answers](figures/accuracy_vs_coverage.png)
+
 ## Reproduce
 
 ```sh
@@ -52,6 +81,9 @@ python3 market_skill.py prepare data/prep data/BTCUSDT_1h.csv:BTCUSDT data/EURUS
 ./bake.sh dir dir1 && ./bake.sh range range1      # 17 min each on an RTX 3060 (CMF_GPU=cuda)
 ./run_eval.sh                                       # overlays, held-set parity, validation and test
 python3 show_report.py results test
+python3 lora_bench.py ~/models/qwen35-08b data/prep range lora_range   # torch, transformers, peft, fla
+python3 logit_probs.py data/prep range test results/logit_range_test.jsonl
+python3 compare.py DATA && python3 make_charts.py DATA figures         # DATA: the predictions, bake logs, LoRA runs
 ```
 
 Yahoo's 1h history reaches back 730 days, so a later fetch covers a later period. The scripts use the standard
