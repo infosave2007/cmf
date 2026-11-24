@@ -4311,8 +4311,9 @@ enum SkillCmd {
         /// A soft-folded skill (`skill bake --soft-fold --no-defrag`) stored as
         /// its per-neuron gains instead of the folded down_proj tensors: the
         /// bake's checkpoint JSON whose `selected_logits` made the specialist.
-        /// Every changed tensor must be rebuilt from the base byte for byte, or
-        /// the export refuses; `skill apply` rebuilds them
+        /// Each changed down_proj the gains rebuild from the base byte for byte
+        /// travels as gains, any other changed tensor (an FCD-trained layer)
+        /// whole; `skill apply` rebuilds them
         #[arg(long)]
         gains_from: Option<String>,
     },
@@ -4528,6 +4529,18 @@ enum SkillCmd {
         /// branch, as the DTG-MA notebooks' autograd does (slower per step)
         #[arg(long)]
         through_attn: bool,
+        /// Where the DTG-MA mask sits: `ffn`, a gate per FFN neuron folded into
+        /// down_proj; or `linear`, a gate per output row of every projection (the
+        /// GDN in-projections and out_proj, q/k/v/o, gate/up/down), as the DTG-MA
+        /// notebooks' DTGMALinear does. `linear` runs on the CUDA resident step
+        /// with --through-attn; `skill export --gains-from` turns a checkpoint
+        /// into the skill
+        #[arg(long, default_value = "ffn", value_parser = ["ffn", "linear"])]
+        mask_scope: String,
+        /// The sparsity weight of --mask-scope linear: λ times the mean over the
+        /// projections of each projection's mean gate (the notebooks' L1)
+        #[arg(long, default_value = "0.02")]
+        lin_l1: f64,
         /// Write each Phase-A evaluation's mask logits into this directory
         /// (phase-a-step-N.json, usable with --mask-from) as the run goes
         #[arg(long)]
@@ -7218,6 +7231,8 @@ async fn main() -> anyhow::Result<()> {
                 fcd_attn,
                 fcd_optim,
                 through_attn,
+                mask_scope,
+                lin_l1,
                 checkpoint_dir,
                 held_tags,
                 target_sparsity,
@@ -7283,6 +7298,8 @@ async fn main() -> anyhow::Result<()> {
                 archaeology_report.as_deref(),
                 analysis_only,
                 skip_runtime_gate,
+                mask_scope == "linear",
+                lin_l1,
             ),
         },
         Commands::Compress(args) => compress::run(args),

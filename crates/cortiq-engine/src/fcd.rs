@@ -670,6 +670,40 @@ impl FcdModel {
     /// sweeps (forward 0..nl, backward nl..0) hit the same physical
     /// layer at most twice per virtual pass, so a small window streams
     /// a model far bigger than RAM without swapping.
+    /// `--mask-scope linear`: the layer's projections whose output rows carry
+    /// a gain, as (CMF tensor name, rows) in the order of
+    /// `gpu_cuda::lin_layout` — GDN in_proj_qkv, in_proj_z, in_proj_a,
+    /// in_proj_b, out_proj; full attention q_proj, k_proj, v_proj (the fused
+    /// qkv's rows in order), o_proj; then gate_proj, up_proj, down_proj.
+    pub(crate) fn lin_modules(&self, li: usize) -> Vec<(String, usize)> {
+        let l = &self.layers[li];
+        let p = format!("model.layers.{li}.");
+        let h = self.hidden;
+        let mut v: Vec<(String, usize)> = match &l.attn {
+            FcdAttn::Gdn { wqkv, wz, wa, wb, .. } => vec![
+                (format!("{p}linear_attn.in_proj_qkv.weight"), wqkv.len() / h),
+                (format!("{p}linear_attn.in_proj_z.weight"), wz.len() / h),
+                (format!("{p}linear_attn.in_proj_a.weight"), wa.len() / h),
+                (format!("{p}linear_attn.in_proj_b.weight"), wb.len() / h),
+                (format!("{p}linear_attn.out_proj.weight"), h),
+            ],
+            FcdAttn::Full { output_gate, .. } => {
+                let q = self.nh * self.hd * if *output_gate { 2 } else { 1 };
+                let kv = self.nkv * self.hd;
+                vec![
+                    (format!("{p}self_attn.q_proj.weight"), q),
+                    (format!("{p}self_attn.k_proj.weight"), kv),
+                    (format!("{p}self_attn.v_proj.weight"), kv),
+                    (format!("{p}self_attn.o_proj.weight"), h),
+                ]
+            }
+        };
+        v.push((format!("{p}mlp.gate_proj.weight"), l.inter));
+        v.push((format!("{p}mlp.up_proj.weight"), l.inter));
+        v.push((format!("{p}mlp.down_proj.weight"), h));
+        v
+    }
+
     pub(crate) fn mats(&self, li: usize) -> Result<std::sync::Arc<LayerMats>, String> {
         {
             let slot = self.mats_cache[li].lock().unwrap();
@@ -1501,6 +1535,7 @@ impl FcdModel {
         scale: f32,
         grad: bool,
         through_attn: bool,
+        lin: Option<&[Vec<f32>]>,
     ) -> Option<crate::gpu_cuda::BkOut> {
         use crate::gpu_cuda::{BakeGdn, BakeGdnW, BkAttn, BkFull, BkLayer, BkStep};
         if !crate::gpu::cuda_active() || self.loops > 1 || ffn.len() != self.layers.len() || mats.len() != self.layers.len() || b == 0 {
@@ -1557,7 +1592,7 @@ impl FcdModel {
                     })
                 }
             };
-            layers.push(BkLayer { iln: w.iln, pln: w.pln, attn, gu, down: w.down, inter: l.inter, gain });
+            layers.push(BkLayer { iln: w.iln, pln: w.pln, attn, gu, down: w.down, inter: l.inter, gain, lin: lin.map(|v| v[li].as_slice()) });
         }
         let step = BkStep {
             layers,

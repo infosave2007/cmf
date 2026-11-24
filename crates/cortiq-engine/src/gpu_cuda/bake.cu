@@ -507,6 +507,38 @@ extern "C" __global__ void bk_to_bf16(const float* __restrict__ x, unsigned shor
     y[i] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
+// The output masks of every Linear (`--mask-scope linear`, the DTG-MA notebooks' DTGMALinear): a projection's
+// output [n][m] times its gain sigma(mask) per column. y = x * g (y may be x).
+extern "C" __global__ void bk_mul_cols(const float* x, const float* g, float* y, long n, int m) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n * (long)m) y[i] = x[i] * g[i % m];
+}
+
+// The gain gradient sum_r y[r][j] * dy[r][j] in two passes, in a fixed order (no atomics: a step stays
+// bit-reproducible): each block sums `rows` rows of 256 columns into part[chunk][j] ...
+extern "C" __global__ void bk_col_dot_part(const float* __restrict__ y, const float* __restrict__ dy, float* __restrict__ part,
+                                           long n, int m, int rows) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    const long r0 = (long)blockIdx.y * rows;
+    const long r1 = r0 + rows < n ? r0 + rows : n;
+    float s = 0.f;
+    for (long r = r0; r < r1; r++) s += y[r * m + j] * dy[r * m + j];
+    part[(long)blockIdx.y * m + j] = s;
+}
+
+// ... then the chunks in order into dg[j]; with `div` the y the parts summed was the gained output (y * g):
+// divided back by g to the projection's own output.
+extern "C" __global__ void bk_col_dot_sum(const float* __restrict__ part, const float* __restrict__ g, float* __restrict__ dg,
+                                          int chunks, int m, int div) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    float s = 0.f;
+    for (int c = 0; c < chunks; c++) s += part[(long)c * m + j];
+    if (div) s /= fmaxf(g[j], 1e-30f);
+    dg[j] += s;
+}
+
 // y = a + b (n elements)
 extern "C" __global__ void bk_add(const float* a, const float* b, float* y, long n) {
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

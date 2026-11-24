@@ -8,11 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `skill bake --mask-scope linear`: the DTG-MA mask on the output rows of every projection — the GDN
+  in-projections and out_proj, q/k/v/o, gate, up and down — as the DTG-MA notebooks' DTGMALinear places it,
+  instead of on the FFN neurons (`ffn`, the default). The CUDA resident step scales each projection's output
+  by its gates and returns their gradient (the pre-gain output of o/out_proj and down is kept, the
+  in-projections' is the recomputed one divided back; the token sums run in a fixed order); the gates train
+  with the notebooks' AdamW and sparsity term (`--lin-l1`, λ times the mean over projections of their mean
+  gate) under `--through-attn`, the FFN neuron gates stay open. `skill export --gains-from` writes a
+  checkpoint as one f32 gain per output row (`.skillrowgain`), `skill apply` scales the base's rows and
+  re-encodes them in each tensor's codec. Qwen3.5-0.8B (399 936 gates over 186 projections, 1.704 MB), RTX
+  3060, 750 steps of 8 records, the 2000 dair-ai/emotion test texts through `serve` with the overlay: one-word
+  answer 89.2 → 90.6 %, JSON answer 90.6 → 91.3 % against the FFN-neuron mask (LoRA r=16 on every linear
+  layer, 43 MB: 91.6 / 92.0 %); 0.18–0.34 s a step. With every gate at 1 the step reproduces the base.
 - `skill export --gains-from CKPT.json`: a soft-folded skill (`skill bake --soft-fold --no-defrag`) stored as
   its per-neuron gains — one f32 per FFN neuron of each changed `down_proj`, σ(logit) from the bake's
-  checkpoint, 0 for a closed neuron — instead of the folded tensors. The export rebuilds every changed tensor
-  from the base and the gains (dequantize, scale the columns, re-encode in the layer's codec) and refuses
-  unless the bytes equal the specialist's; `skill apply`, full or `--overlay`, rebuilds them the same way.
+  checkpoint, 0 for a closed neuron — instead of the folded tensors. The export rebuilds each changed down_proj
+  from the base and the gains (dequantize, scale the columns, re-encode in the layer's codec) and stores it as
+  gains only when the bytes equal the specialist's; any other changed tensor (a layer FCD trained) is stored
+  whole. `skill apply`, full or `--overlay`, rebuilds the gains the same way.
   The Qwen3.5-0.8B market skills (`scripts/market-skill`): 0.378 MB instead of 88.4 MB, 24 of 24 `down_proj`
   byte-identical, `apply --overlay` in 0.41 s, and the served predictions on the 480 held records identical
   to the folded skill's (max |Δp| = 0).
@@ -27,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.62 s a step in torch.
 
 ### Fixed
+- `skill bake` on CUDA no longer drops to the layer path for the rest of a bake when the resident step runs out
+  of card memory: the held evaluation's batch left its scratch and per-layer saves on the card, the next
+  training step's allocation failed (batch 64 on a 12 GB RTX 3060), and every later step ran ~10× slower on
+  the host path. The step now frees its scratch and saves — the frozen weights stay — and runs again on the
+  card; the layer path takes over only when that fails too.
 - The CUDA engine's lib tests compile again: `nvgt`'s GDN-core test called the bake's host entry
   `bake_gdn_bwd`, a name the NVG device operator of the bake now shadows inside `nvgt`.
 - The NVG trainer's per-position GDN reverse kernel (`CMF_NVG_GDN_REV=kernel`, the reference of the chunked
