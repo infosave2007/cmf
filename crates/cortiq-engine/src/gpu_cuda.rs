@@ -91,6 +91,9 @@ enum Gemm {
     Tf32,
     /// f16 operands, f32 accumulation and output: twice TF32's rate.
     Half,
+    /// bf16 operands (f32's range, an 8-bit significand), f32 accumulation
+    /// and output: f16's rate without its overflow and underflow.
+    Bf16,
 }
 
 /// `CMF_CUDA_PREC`: the prompt's precision, as (weight GEMMs, attention GEMMs).
@@ -1516,7 +1519,7 @@ impl Ctx {
     }
 
     /// C[m x n] = alpha * op(A) * op(B) + beta * C, column-major. C is f32;
-    /// A and B are f32, or f16 under `Gemm::Half`.
+    /// A and B are f32, or f16 under `Gemm::Half`, bf16 under `Gemm::Bf16`.
     #[allow(clippy::too_many_arguments)]
     unsafe fn gemm(
         &self,
@@ -1555,10 +1558,10 @@ impl Ctx {
                     ldc as i32,
                 )
             } else {
-                let (ty, compute) = if mode == Gemm::Half {
-                    (bl::cudaDataType::CUDA_R_16F, bl::cublasComputeType_t::CUBLAS_COMPUTE_32F)
-                } else {
-                    (bl::cudaDataType::CUDA_R_32F, bl::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32)
+                let (ty, compute) = match mode {
+                    Gemm::Half => (bl::cudaDataType::CUDA_R_16F, bl::cublasComputeType_t::CUBLAS_COMPUTE_32F),
+                    Gemm::Bf16 => (bl::cudaDataType::CUDA_R_16BF, bl::cublasComputeType_t::CUBLAS_COMPUTE_32F),
+                    _ => (bl::cudaDataType::CUDA_R_32F, bl::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32),
                 };
                 bl::cublasGemmEx(
                     self.blas,

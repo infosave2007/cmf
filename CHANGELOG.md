@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `skill export --gains-from CKPT.json`: a soft-folded skill (`skill bake --soft-fold --no-defrag`) stored as
+  its per-neuron gains — one f32 per FFN neuron of each changed `down_proj`, σ(logit) from the bake's
+  checkpoint, 0 for a closed neuron — instead of the folded tensors. The export rebuilds every changed tensor
+  from the base and the gains (dequantize, scale the columns, re-encode in the layer's codec) and refuses
+  unless the bytes equal the specialist's; `skill apply`, full or `--overlay`, rebuilds them the same way.
+  The Qwen3.5-0.8B market skills (`scripts/market-skill`): 0.378 MB instead of 88.4 MB, 24 of 24 `down_proj`
+  byte-identical, `apply --overlay` in 0.41 s, and the served predictions on the 480 held records identical
+  to the folded skill's (max |Δp| = 0).
+- `CMF_BAKE_RES_BF16=1`: the CUDA resident Phase-A step takes its weight products (the projections, the FFN
+  and their transposes) on bf16 operands with f32 accumulation — the precision torch's bf16 autocast trains a
+  LoRA in, at twice TF32's tensor rate on a GeForce card; the frozen weights get a bf16 copy on the card
+  beside the f32 ones, the activations are rounded on the way in, the attention products, the head and the
+  GDN gates stay as they were. Default off: Phase A keeps strict f32. Qwen3.5-0.8B market skill (`range`,
+  8 records of ~250 tokens a step, `--through-attn`), RTX 3060: 1.02 → 0.57 s a step (TF32 0.73), the
+  750-step bake 1043 → 622 s; the mask gradient off the f32 one by 3–10 % (worst layer), the best held
+  accuracy 68.75 % against 68.54 %. A LoRA r=16 on every linear layer with the same records and loss takes
+  0.62 s a step in torch.
+
+### Fixed
+- The CUDA engine's lib tests compile again: `nvgt`'s GDN-core test called the bake's host entry
+  `bake_gdn_bwd`, a name the NVG device operator of the bake now shadows inside `nvgt`.
+- The NVG trainer's per-position GDN reverse kernel (`CMF_NVG_GDN_REV=kernel`, the reference of the chunked
+  sweep) launches on an RTX 3060: a launch bound keeps its registers within a block of 512 threads, where the
+  sm_86 build had failed with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
+
 ## [0.9.18] — 2026-11-24
 
 ### Added

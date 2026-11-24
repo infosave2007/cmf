@@ -3002,7 +3002,7 @@ mod tests {
         let norm: Vec<f32> = rnd(DKV, 9, 0.1).iter().map(|x| 1.0 + x).collect();
         let bg = BakeGdn { nv, nk, dk: DKV, dv: DKV, kk, eps: 1e-6, conv: &conv, a_log: &a_log, dt_bias: &dt_bias, norm: &norm };
         let out_ref = bake_gdn_fwd(&qkv, &z, &a, &b, nb, t, &bg).expect("bake forward");
-        let (draw_ref, dz_ref, da_ref, db_ref) = bake_gdn_bwd(&qkv, &z, &a, &b, &dout, nb, t, &bg).expect("bake backward");
+        let (draw_ref, dz_ref, da_ref, db_ref) = super::super::bake::bake_gdn_bwd(&qkv, &z, &a, &b, &dout, nb, t, &bg).expect("bake backward");
         let d = enter().unwrap();
         let up = |v: &[f32]| DBuf::from(v).unwrap();
         let fl = |n: usize| DBuf::floats(d.c, n).unwrap();

@@ -776,12 +776,63 @@ pub fn run_skill_add(
 /// identity keys (`base_dir_hash`, `base_arch`, `task`) that let `apply`
 /// refuse the wrong base. Payloads are borrowed straight from the
 /// specialist's mmap — a 2.4 GB specialist exports without materializing.
+/// A soft-folded skill stored as its gains (`skill export --gains-from`):
+/// instead of each folded `down_proj`, the layer's per-neuron gain σ(m) — 0
+/// for a dead neuron — as an f32 vector named `{tensor}{GAIN_SUFFIX}`.
+/// `skill apply` rebuilds the tensor from the base (its dequantized columns ×
+/// the gains, in the codec the bake picks), byte for byte what the bake wrote.
+const GAIN_SUFFIX: &str = ".skillgain";
+
+/// The bake's soft fold of `name` (a `[hidden, inter]` down_proj) by `gains`
+/// on `base`: dequantize, scale the columns, encode as `skill bake` encodes a
+/// full-shape folded down_proj (the layer's gate codec; q8_2f when the width
+/// is not a multiple of 32).
+fn fold_down(base: &CmfModel, name: &str, gains: &[f32]) -> anyhow::Result<(TensorDtype, Vec<usize>, Vec<u8>)> {
+    let e = base.tensors.iter().find(|t| t.name == name).with_context(|| format!("the base has no tensor {name}"))?;
+    anyhow::ensure!(
+        e.shape.len() == 2 && e.shape[1] == gains.len(),
+        "{name}: {:?} does not take {} gains",
+        e.shape,
+        gains.len()
+    );
+    let (rows, cols) = (e.shape[0], e.shape[1]);
+    let mut vals = vec![0f32; rows * cols];
+    cortiq_core::quant::dequant_tensor(e, base.tensor_bytes(name)?, &mut vals).map_err(|e| anyhow::anyhow!(e))?;
+    for row in vals.chunks_exact_mut(cols) {
+        for (v, &g) in row.iter_mut().zip(gains) {
+            // a dead column is zeroed before the fold, as the bake does
+            *v = if g == 0.0 { 0.0 } else { *v * g };
+        }
+    }
+    let gate = name.replace(".down_proj.", ".gate_proj.");
+    let gate_dtype = base.tensors.iter().find(|t| t.name == gate).map_or(e.dtype, |t| t.dtype);
+    let q_rowsafe = dtype_to_quant(gate_dtype, weight_quant_hint(base)).context("unsupported ffn dtype")?;
+    let q = if cols % 32 == 0 { q_rowsafe } else { Quant::Q8_2f };
+    let (dtype, data) = quantize_2d(q, &vals, rows, cols);
+    Ok((dtype, vec![rows, cols], data))
+}
+
+/// The gain tensors of `skill` rebuilt into full tensors against `base`.
+fn expand_gains(base: &CmfModel, skill: &CmfModel) -> anyhow::Result<Vec<TensorSpec>> {
+    let mut out = Vec::new();
+    for t in skill.tensors.iter().filter(|t| t.name.ends_with(GAIN_SUFFIX)) {
+        let name = &t.name[..t.name.len() - GAIN_SUFFIX.len()];
+        let bytes = skill.tensor_bytes(&t.name)?;
+        anyhow::ensure!(t.dtype == TensorDtype::F32 && bytes.len() % 4 == 0, "{}: gains must be f32", t.name);
+        let gains: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let (dtype, shape, data) = fold_down(base, name, &gains)?;
+        out.push(TensorSpec { name: name.to_string(), dtype, shape, data });
+    }
+    Ok(out)
+}
+
 pub fn run_skill_export(
     specialist_path: &str,
     base_path: &str,
     id: &str,
     name: Option<&str>,
     output: &str,
+    gains_from: Option<&str>,
 ) -> anyhow::Result<()> {
     use cortiq_core::TensorSpecRef;
     let spec = CmfModel::open(specialist_path)?;
@@ -884,6 +935,57 @@ pub fn run_skill_export(
         anyhow::bail!("specialist and base are byte-identical — no skill to export");
     }
     layers.sort_unstable();
+    // --gains-from: every changed tensor must be a soft-folded down_proj that
+    // the checkpoint's mask logits rebuild byte for byte from the base; the
+    // file then carries the gains instead of the tensors.
+    let mut gain_bytes: Vec<(String, Vec<u8>, usize)> = Vec::new();
+    if let Some(ck) = gains_from {
+        let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(ck).with_context(|| format!("reading {ck}"))?)
+            .with_context(|| format!("parsing {ck}"))?;
+        let logits: Vec<Vec<f32>> = j
+            .get("selected_logits")
+            .and_then(|v| v.as_array())
+            .with_context(|| format!("{ck} has no selected_logits (a skill bake checkpoint)"))?
+            .iter()
+            .map(|l| l.as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(f64::NAN) as f32).collect()))
+            .collect::<Option<_>>()
+            .context("selected_logits: not a list of lists")?;
+        for r in &refs {
+            let li = r
+                .name
+                .strip_prefix("model.layers.")
+                .and_then(|x| x.strip_suffix(".mlp.down_proj.weight"))
+                .and_then(|x| x.parse::<usize>().ok())
+                .with_context(|| format!("--gains-from: {} changed, and only folded down_proj tensors can be gains", r.name))?;
+            let l = logits.get(li).with_context(|| format!("{ck}: no logits for layer {li}"))?;
+            anyhow::ensure!(r.shape.len() == 2 && r.shape[1] == l.len(), "{}: {:?} against {} logits", r.name, r.shape, l.len());
+            let (rows, cols) = (r.shape[0], r.shape[1]);
+            // a dead neuron's column is zero in the specialist
+            let e = spec.tensors.iter().find(|t| t.name == r.name).context("specialist tensor")?;
+            let mut sv = vec![0f32; rows * cols];
+            cortiq_core::quant::dequant_tensor(e, r.data, &mut sv).map_err(|e| anyhow::anyhow!(e))?;
+            let gains: Vec<f32> = (0..cols)
+                .map(|c| {
+                    let alive = (0..rows).any(|row| sv[row * cols + c] != 0.0);
+                    if alive { 1.0 / (1.0 + (-l[c]).exp()) } else { 0.0 }
+                })
+                .collect();
+            let (dtype, _, data) = fold_down(&base, &r.name, &gains)?;
+            anyhow::ensure!(
+                dtype == r.dtype && data.as_slice() == r.data,
+                "{}: the base folded by {ck}'s gains is not the specialist's tensor — another checkpoint, or a tensor the fold does not explain",
+                r.name
+            );
+            gain_bytes.push((format!("{}{GAIN_SUFFIX}", r.name), gains.iter().flat_map(|g| g.to_le_bytes()).collect(), cols));
+        }
+    }
+    let n_tensors = refs.len();
+    if gains_from.is_some() {
+        refs = gain_bytes
+            .iter()
+            .map(|(n, b, cols)| TensorSpecRef { name: n.clone(), dtype: TensorDtype::F32, shape: vec![*cols], data: b.as_slice() })
+            .collect();
+    }
     let mut header = if embedded.is_some() {
         base.header.clone()
     } else {
@@ -926,15 +1028,19 @@ pub fn run_skill_export(
         provenance: Some(serde_json::json!({
             "cut_from": std::path::Path::new(specialist_path)
                 .file_name().map(|s| s.to_string_lossy().into_owned()),
-            "tensors": refs.len(),
+            "tensors": n_tensors,
             "embedded": embedded_record.is_some(),
+            "gains": gains_from.is_some(),
         })),
     }];
     let catalog = (!spec.masks.masks.is_empty()).then(|| spec.masks.clone());
     CmfModel::write_ref(output, &header, &refs, catalog.as_ref(), None)?;
     let sz = std::fs::metadata(output)?.len();
+    if gains_from.is_some() {
+        println!("  {n_tensors} folded down_proj rebuilt from the base byte for byte; the file carries their gains");
+    }
     println!(
-        "✓ skill '{id}': {} tensor(s) across layers {:?}, {} masks | {:.1} MB (specialist was {:.1} MB)",
+        "✓ skill '{id}': {} tensor(s) across layers {:?}, {} masks | {:.3} MB (specialist was {:.1} MB)",
         refs.len(),
         layers,
         spec.masks.masks.len(),
@@ -995,16 +1101,24 @@ pub fn run_skill_apply(
             );
         }
     }
+    // gains (`skill export --gains-from`) rebuild their tensors from the base
+    let expanded = expand_gains(&base, &skill)?;
     if overlay {
-        return apply_as_overlay(&base, &skill, rec, output);
+        return apply_as_overlay(&base, &skill, rec, output, &expanded);
     }
+    let rebuilt: std::collections::HashMap<&str, &TensorSpec> = expanded.iter().map(|t| (t.name.as_str(), t)).collect();
     let over: std::collections::HashMap<&str, &TensorEntry> =
-        skill.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        skill.tensors.iter().filter(|t| !t.name.ends_with(GAIN_SUFFIX)).map(|t| (t.name.as_str(), t)).collect();
     let bbytes = base.primary_bytes();
     let sbytes = skill.primary_bytes();
     let mut refs: Vec<TensorSpecRef> = Vec::with_capacity(base.tensors.len());
     let mut replaced = 0usize;
     for e in &base.tensors {
+        if let Some(t) = rebuilt.get(e.name.as_str()) {
+            replaced += 1;
+            refs.push(TensorSpecRef { name: t.name.clone(), dtype: t.dtype, shape: t.shape.clone(), data: &t.data });
+            continue;
+        }
         let (src, m, bytes) = match over.get(e.name.as_str()) {
             Some(s) => (*s, &skill, sbytes),
             None => (e, &base, bbytes),
@@ -1060,6 +1174,7 @@ fn apply_as_overlay(
     skill: &CmfModel,
     rec: &SkillRecord,
     output: &str,
+    expanded: &[TensorSpec],
 ) -> anyhow::Result<()> {
     use cortiq_core::TensorSpecRef;
     let id = rec.id.as_str();
@@ -1083,7 +1198,10 @@ fn apply_as_overlay(
             data: &bbytes[abs..abs + e.nbytes as usize],
         });
     }
-    for e in &skill.tensors {
+    for t in expanded {
+        refs.push(TensorSpecRef { name: format!("skill.{id}.{}", t.name), dtype: t.dtype, shape: t.shape.clone(), data: &t.data });
+    }
+    for e in skill.tensors.iter().filter(|t| !t.name.ends_with(GAIN_SUFFIX)) {
         let b = base_by_name.get(e.name.as_str()).ok_or_else(|| {
             anyhow::anyhow!("skill tensor {} is absent from the base — nothing to overlay it on", e.name)
         })?;

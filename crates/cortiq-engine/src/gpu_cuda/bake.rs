@@ -34,6 +34,7 @@ struct BkFuncs {
     gate_bwd: cs::CUfunction,
     gather: cs::CUfunction,
     scatter_add: cs::CUfunction,
+    to_bf16: cs::CUfunction,
 }
 
 #[derive(Default)]
@@ -43,6 +44,9 @@ struct BkState {
     /// `bake_gemm_dx`'s frozen matrices on the card, by (address, values):
     /// a fingerprint of the values beside them; `w_bytes` held.
     w: HashMap<(usize, usize), (u64, Buf)>,
+    /// The same by bf16 copy, for the resident step's `Gemm::Bf16` products
+    /// (counted in `w_bytes` too).
+    wbf: HashMap<(usize, usize), (u64, Buf)>,
     w_bytes: usize,
     /// A training forward's gate/up planes `[n][2·inter]` by layer, for its
     /// backward (`bake_ffn_bwd` takes them).
@@ -87,6 +91,7 @@ impl BkState {
             // `CMF_BAKE_W_GB` (default 24): a 4B replica is ~16 GB of f32
             if self.w_bytes + w.len() * 4 > w_cap() {
                 self.w.clear();
+                self.wbf.clear();
                 self.w_bytes = 0;
             }
             let b = Buf::from_slice(w)?;
@@ -95,6 +100,41 @@ impl BkState {
         }
         Ok(self.w[&key].1.ptr)
     }
+
+    /// A frozen matrix as the A operand of a `mode` product: its bf16 copy
+    /// under `Gemm::Bf16` (rounded on the host once, kept like `weight`),
+    /// else the f32 one.
+    fn wm(&mut self, w: &[f32], mode: Gemm) -> Res<u64> {
+        if mode != Gemm::Bf16 {
+            return self.weight(w);
+        }
+        let fp = crate::gpu::fp_f32(w);
+        let key = (w.as_ptr() as usize, w.len());
+        if !self.wbf.get(&key).is_some_and(|(f, _)| *f == fp) {
+            if let Some((_, old)) = self.wbf.remove(&key) {
+                self.w_bytes -= old.bytes;
+            }
+            if self.w_bytes + w.len() * 2 > w_cap() {
+                self.w.clear();
+                self.wbf.clear();
+                self.w_bytes = 0;
+            }
+            let h: Vec<u16> = w.iter().map(|&v| bf16_bits(v)).collect();
+            let b = Buf::from_slice(&h)?;
+            self.w_bytes += b.bytes;
+            self.wbf.insert(key, (fp, b));
+        }
+        Ok(self.wbf[&key].1.ptr)
+    }
+}
+
+/// f32 → bf16 bits, rounded to nearest even (as `bk_to_bf16`).
+fn bf16_bits(v: f32) -> u16 {
+    let u = v.to_bits();
+    if u & 0x7fff_ffff > 0x7f80_0000 {
+        return ((u >> 16) | 0x40) as u16;
+    }
+    ((u + 0x7fff + ((u >> 16) & 1)) >> 16) as u16
 }
 
 // SAFETY: the functions are used under the context's state lock.
@@ -115,6 +155,32 @@ fn gemm_mode() -> Gemm {
     } else {
         Gemm::Tf32
     }
+}
+
+/// The resident step's weight products (projections, FFN, their
+/// transposes): `CMF_BAKE_RES_BF16=1` gives them bf16 operands with f32
+/// accumulation — the precision torch's bf16 autocast trains a LoRA in, at
+/// twice TF32's tensor rate on a GeForce card. The attention products, the
+/// head and the GDN gates keep `gemm_mode()` / f32. Default: `gemm_mode()`.
+fn res_mode() -> Gemm {
+    static BF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BF.get_or_init(|| std::env::var("CMF_BAKE_RES_BF16").as_deref() == Ok("1")) {
+        Gemm::Bf16
+    } else {
+        gemm_mode()
+    }
+}
+
+/// `x` (`cnt` f32 values on the card) as the B operand of a `mode` product:
+/// converted into scratch `name` under `Gemm::Bf16`, else `x` itself.
+unsafe fn bop(c: &Ctx, s: &mut BkState, f: &BkFuncs, x: u64, cnt: usize, name: &'static str, mode: Gemm) -> Res<u64> {
+    if mode != Gemm::Bf16 {
+        return Ok(x);
+    }
+    let y = s.scr(name, cnt * 2)?;
+    let n = cnt as i64;
+    unsafe { c.launch(f.to_bf16, ((cnt as u64).div_ceil(256) as u32, 1), 256, 0, kargs!(x, y, n))? };
+    Ok(y)
 }
 
 /// The geometry and frozen constants of one GDN layer.
@@ -175,6 +241,7 @@ fn funcs(c: &Ctx, s: &mut BkState, dk: usize, dv: usize) -> Res<BkFuncs> {
                 gate_bwd: func(m, "bk_gate_bwd")?,
                 gather: func(m, "bk_gather")?,
                 scatter_add: func(m, "bk_scatter_add")?,
+                to_bf16: func(m, "bk_to_bf16")?,
             })
         })
         .clone()
@@ -913,8 +980,8 @@ unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u6
     if a.wqkv.len() != fused * hsz || a.wo.len() != hsz * qdim || hd > 512 || a.rope.len() < t * a.half * 2 {
         return Err("full attention geometry".into());
     }
-    let mode = gemm_mode();
-    let (wq, wo) = (s.weight(a.wqkv)?, s.weight(a.wo)?);
+    let (mode, amode) = (res_mode(), gemm_mode());
+    let (wq, wo) = (s.wm(a.wqkv, mode)?, s.wm(a.wo, mode)?);
     let rope = s.up(c, "rope", a.rope)?;
     let (qn, kn) = (match a.q_norm { Some(w) => s.up(c, "qn", w)?, None => s.scr("qn", 4)? }, match a.k_norm { Some(w) => s.up(c, "kn", w)?, None => s.scr("kn", 4)? });
     let qkv = s.scr("qkv", n * fused * 4)?;
@@ -929,21 +996,23 @@ unsafe fn full_attn_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x: u6
     let (b_i, one, rep_i, w_i) = (b as i32, 1i32, rep as i32, a.window.map_or(0, |w| w as i32));
     let scale = 1.0 / (hd as f32).sqrt();
     unsafe {
-        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, fused, mode)?;
+        let xo = bop(c, s, f, x, n * hsz, "bfx", mode)?;
+        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, fused, mode)?;
         c.launch(f.attn_prep, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, qr, kr, vp, gt, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
         let grid = ((per as u64).div_ceil(256) as u32, 1);
         c.launch(f.attn_perm, grid, 256, 0, kargs!(qr, qp, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(kr, kp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(vp, vpp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
-        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, mode)?;
+        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, amode)?;
         c.launch(f.softmax_fwd, ((cnt * t) as u32, 1), 128, 0, kargs!(sm, pm, ptm, t_i, w_i))?;
-        c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, mode)?;
+        c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, amode)?;
         c.launch(f.attn_unperm, (((n * qdim) as u64).div_ceil(256) as u32, 1), 256, 0, kargs!(op, ao, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         if a.gated {
             let tot = (n * qdim) as i64;
             c.launch(f.gate_mul, (((n * qdim) as u64).div_ceil(256) as u32, 1), 256, 0, kargs!(ao, gt, tot))?;
         }
-        c.gemm(true, false, hsz, n, qdim, 1.0, wo, qdim, ao, qdim, 0.0, y, hsz, mode)?;
+        let aoo = bop(c, s, f, ao, n * qdim, "bfy", mode)?;
+        c.gemm(true, false, hsz, n, qdim, 1.0, wo, qdim, aoo, qdim, 0.0, y, hsz, mode)?;
     }
     Ok(())
 }
@@ -962,8 +1031,8 @@ unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x
     if a.wqkv.len() != fused * hsz || a.wo.len() != hsz * qdim || hd > 512 || a.rope.len() < t * a.half * 2 {
         return Err("full attention geometry".into());
     }
-    let mode = gemm_mode();
-    let (wq, wo) = (s.weight(a.wqkv)?, s.weight(a.wo)?);
+    let (mode, amode) = (res_mode(), gemm_mode());
+    let (wq, wo) = (s.wm(a.wqkv, mode)?, s.wm(a.wo, mode)?);
     let rope = s.up(c, "rope", a.rope)?;
     let (qn, kn) = (match a.q_norm { Some(w) => s.up(c, "qn", w)?, None => s.scr("qn", 4)? }, match a.k_norm { Some(w) => s.up(c, "kn", w)?, None => s.scr("kn", 4)? });
     let qkv = s.scr("qkv", n * fused * 4)?;
@@ -990,36 +1059,39 @@ unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x
     let kvg = (((n * kvdim) as u64).div_ceil(256) as u32, 1);
     unsafe {
         // the forward again, to P and the pre-gate head outputs
-        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, fused, mode)?;
+        let xo = bop(c, s, f, x, n * hsz, "bfx", mode)?;
+        c.gemm(true, false, fused, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, fused, mode)?;
         c.launch(f.attn_prep, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, qr, kr, vp, gt, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(qr, qp, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(kr, kp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         c.launch(f.attn_perm, grid, 256, 0, kargs!(vp, vpp, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
-        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, mode)?;
+        c.gemm_batched(true, t, t, hd, scale, kp, hd, t * hd, qp, hd, t * hd, sm, t, t * t, cnt, amode)?;
         c.launch(f.softmax_fwd, ((cnt * t) as u32, 1), 128, 0, kargs!(sm, pm, ptm, t_i, w_i))?;
         if a.gated {
-            c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, mode)?;
+            c.gemm_batched(false, hd, t, t, 1.0, vpp, hd, t * hd, pm, t, t * t, op, hd, t * hd, cnt, amode)?;
             c.launch(f.attn_unperm, qg, 256, 0, kargs!(op, ao, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         }
         // dao_eff = dy·Wo; through the output gate
-        c.gemm(false, false, qdim, n, hsz, 1.0, wo, qdim, dy, hsz, 0.0, dao, qdim, mode)?;
+        let dyo = bop(c, s, f, dy, n * hsz, "bfy", mode)?;
+        c.gemm(false, false, qdim, n, hsz, 1.0, wo, qdim, dyo, hsz, 0.0, dao, qdim, mode)?;
         if a.gated {
             let tot = (n * qdim) as i64;
             c.launch(f.gate_bwd, qg, 256, 0, kargs!(dao, ao, gt, dgt, tot))?;
         }
         // the core: dP = dO·Vᵀ, dS, dQ = dS·K/√hd, dK = dSᵀ·Q/√hd, dV = Pᵀ·dO
         c.launch(f.attn_perm, grid, 256, 0, kargs!(dao, dop, b_i, t_i, nh_i, nh_i, hd_i, one))?;
-        c.gemm_batched(true, t, t, hd, 1.0, vpp, hd, t * hd, dop, hd, t * hd, dp, t, t * t, cnt, mode)?;
+        c.gemm_batched(true, t, t, hd, 1.0, vpp, hd, t * hd, dop, hd, t * hd, dp, t, t * t, cnt, amode)?;
         c.launch(f.softmax_bwd, ((cnt * t) as u32, 1), 128, 0, kargs!(pm, dp, ds, dst, t_i))?;
-        c.gemm_batched(false, hd, t, t, scale, kp, hd, t * hd, ds, t, t * t, dqp, hd, t * hd, cnt, mode)?;
-        c.gemm_batched(false, hd, t, t, scale, qp, hd, t * hd, dst, t, t * t, dkp, hd, t * hd, cnt, mode)?;
-        c.gemm_batched(false, hd, t, t, 1.0, dop, hd, t * hd, ptm, t, t * t, dvp, hd, t * hd, cnt, mode)?;
+        c.gemm_batched(false, hd, t, t, scale, kp, hd, t * hd, ds, t, t * t, dqp, hd, t * hd, cnt, amode)?;
+        c.gemm_batched(false, hd, t, t, scale, qp, hd, t * hd, dst, t, t * t, dkp, hd, t * hd, cnt, amode)?;
+        c.gemm_batched(false, hd, t, t, 1.0, dop, hd, t * hd, ptm, t, t * t, dvp, hd, t * hd, cnt, amode)?;
         c.launch(f.attn_unperm, qg, 256, 0, kargs!(dqp, dq, b_i, t_i, nh_i, nh_i, hd_i, one))?;
         c.launch(f.attn_unperm, kvg, 256, 0, kargs!(dkp, dk, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         c.launch(f.attn_unperm, kvg, 256, 0, kargs!(dvp, dv, b_i, t_i, nh_i, nkv_i, hd_i, rep_i))?;
         // RoPE and the q/k norm back to the projections, then their transpose
         c.launch(f.attn_prep_bwd, (n as u32, (nh + nkv) as u32), hd.min(512) as u32, 0, kargs!(qkv, qn, kn, rope, dq, dk, dv, dgt, dqkv, t_i, nh_i, nkv_i, hd_i, half_i, gated_i, eps, gm_i, hq, hk))?;
-        c.gemm(false, false, hsz, n, fused, 1.0, wq, hsz, dqkv, fused, 0.0, dx, hsz, mode)?;
+        let dqo = bop(c, s, f, dqkv, n * fused, "bfx", mode)?;
+        c.gemm(false, false, hsz, n, fused, 1.0, wq, hsz, dqo, fused, 0.0, dx, hsz, mode)?;
     }
     Ok(())
 }
@@ -1031,8 +1103,8 @@ unsafe fn full_attn_bwd_dev(c: &Ctx, s: &mut BkState, f: &BkFuncs, a: &BkFull, x
 #[allow(clippy::too_many_arguments)]
 unsafe fn gdn_bwd_dev(c: &'static Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn, w: &BakeGdnW, x: u64, dy: u64, dx: u64, b: usize, t: usize, hsz: usize) -> Res<()> {
     let (n, cdim, vd, nv) = (b * t, g.c_dim(), g.nv * g.dv, g.nv);
-    let mode = gemm_mode();
-    let (wq, wz, wa, wb, wo) = (s.weight(w.wqkv)?, s.weight(w.wz)?, s.weight(w.wa)?, s.weight(w.wb)?, s.weight(w.wout)?);
+    let mode = res_mode();
+    let (wq, wz, wa, wb, wo) = (s.wm(w.wqkv, mode)?, s.wm(w.wz, mode)?, s.weight(w.wa)?, s.weight(w.wb)?, s.wm(w.wout, mode)?);
     let (qkv, z, a, bb) = (s.scr("qkv", n * cdim * 4)?, s.scr("z", n * vd * 4)?, s.scr("a", n * nv * 4)?, s.scr("b", n * nv * 4)?);
     let (taps, alog, dtb, nw) = (s.up(c, "taps", g.conv)?, s.up(c, "alog", g.a_log)?, s.up(c, "dtb", g.dt_bias)?, s.up(c, "nw", g.norm)?);
     let dof = s.scr("bdof", n * vd * 4)?;
@@ -1046,12 +1118,14 @@ unsafe fn gdn_bwd_dev(c: &'static Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn
     let eps = g.eps;
     let tot = (n * cdim) as u64;
     unsafe {
-        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, x, hsz, 0.0, qkv, cdim, mode)?;
-        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, x, hsz, 0.0, z, vd, mode)?;
+        let xo = bop(c, s, f, x, n * hsz, "bfx", mode)?;
+        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, cdim, mode)?;
+        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, xo, hsz, 0.0, z, vd, mode)?;
         c.gemm(true, false, nv, n, hsz, 1.0, wa, hsz, x, hsz, 0.0, a, nv, Gemm::F32)?;
         c.gemm(true, false, nv, n, hsz, 1.0, wb, hsz, x, hsz, 0.0, bb, nv, Gemm::F32)?;
         // dof = dy·Wout
-        c.gemm(false, false, vd, n, hsz, 1.0, wo, vd, dy, hsz, 0.0, dof, vd, mode)?;
+        let dyo = bop(c, s, f, dy, n * hsz, "bfy", mode)?;
+        c.gemm(false, false, vd, n, hsz, 1.0, wo, vd, dyo, hsz, 0.0, dof, vd, mode)?;
         if nvg {
             super::nvgt::bake_gdn_bwd(c, (b, t, nv, g.nk, g.kk, eps), [alog, dtb, nw, taps], qkv, z, a, bb, dof, draw, dz, da, db).map_err(|e| format!("nvg gdn: {e}"))?;
         } else {
@@ -1073,8 +1147,10 @@ unsafe fn gdn_bwd_dev(c: &'static Ctx, s: &mut BkState, f: &BkFuncs, g: &BakeGdn
             c.launch(f.conv_bwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(pre, dcq, taps, draw, n_i, t_i, cd_i, kk_i))?;
         }
         // dx = draw·Wqkv + dz·Wz + da·Wa + db·Wb
-        c.gemm(false, false, hsz, n, cdim, 1.0, wq, hsz, draw, cdim, 0.0, dx, hsz, mode)?;
-        c.gemm(false, false, hsz, n, vd, 1.0, wz, hsz, dz, vd, 1.0, dx, hsz, mode)?;
+        let dro = bop(c, s, f, draw, n * cdim, "bfx", mode)?;
+        c.gemm(false, false, hsz, n, cdim, 1.0, wq, hsz, dro, cdim, 0.0, dx, hsz, mode)?;
+        let dzo = bop(c, s, f, dz, n * vd, "bfy", mode)?;
+        c.gemm(false, false, hsz, n, vd, 1.0, wz, hsz, dzo, vd, 1.0, dx, hsz, mode)?;
         c.gemm(false, false, hsz, n, nv, 1.0, wa, hsz, da, nv, 1.0, dx, hsz, Gemm::F32)?;
         c.gemm(false, false, hsz, n, nv, 1.0, wb, hsz, db, nv, 1.0, dx, hsz, Gemm::F32)?;
     }
@@ -1155,7 +1231,7 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             Some((dk, dv)) => funcs(c, s, dk, dv)?,
             None => funcs(c, s, 128, 128)?,
         };
-        let mode = gemm_mode();
+        let (mode, amode) = (res_mode(), gemm_mode());
         let (eps, gm) = (st.eps, st.gemma as i32);
         let hsz_i = hsz as i32;
         let gelu = (st.act == crate::fcd_ops::FfnAct::GeluErf) as i32;
@@ -1209,21 +1285,23 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             match &l.attn {
                 BkAttn::Gdn(g, w) => {
                     let (cdim, vd, nv) = (g.c_dim(), g.nv * g.dv, g.nv);
-                    let (wq, wz, wa, wb, wo) = (s.weight(w.wqkv)?, s.weight(w.wz)?, s.weight(w.wa)?, s.weight(w.wb)?, s.weight(w.wout)?);
+                    let (wq, wz, wa, wb, wo) = (s.wm(w.wqkv, mode)?, s.wm(w.wz, mode)?, s.weight(w.wa)?, s.weight(w.wb)?, s.wm(w.wout, mode)?);
                     let (qkv, z, a, bb) = (s.scr("qkv", n * cdim * 4)?, s.scr("z", n * vd * 4)?, s.scr("a", n * nv * 4)?, s.scr("b", n * nv * 4)?);
                     let (taps, alog, dtb, nw) = (s.up(c, "taps", g.conv)?, s.up(c, "alog", g.a_log)?, s.up(c, "dtb", g.dt_bias)?, s.up(c, "nw", g.norm)?);
                     let (pre, cq, of) = (s.scr("pre", n * cdim * 4)?, s.scr("cq", n * cdim * 4)?, s.scr("of", n * vd * 4)?);
                     let (t_i, cd_i, kk_i, nv_i, nk_i, seq0) = (t as i32, cdim as i32, g.kk as i32, nv as i32, g.nk as i32, 0i32);
                     let geps = g.eps;
                     unsafe {
-                        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, nrm, hsz, 0.0, qkv, cdim, mode)?;
-                        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, nrm, hsz, 0.0, z, vd, mode)?;
+                        let xo = bop(c, s, &f, nrm, n * hsz, "bfx", mode)?;
+                        c.gemm(true, false, cdim, n, hsz, 1.0, wq, hsz, xo, hsz, 0.0, qkv, cdim, mode)?;
+                        c.gemm(true, false, vd, n, hsz, 1.0, wz, hsz, xo, hsz, 0.0, z, vd, mode)?;
                         c.gemm(true, false, nv, n, hsz, 1.0, wa, hsz, nrm, hsz, 0.0, a, nv, Gemm::F32)?;
                         c.gemm(true, false, nv, n, hsz, 1.0, wb, hsz, nrm, hsz, 0.0, bb, nv, Gemm::F32)?;
                         let tot = (n * cdim) as u64;
                         c.launch(f.conv_fwd, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(qkv, taps, pre, cq, n_i, t_i, cd_i, kk_i))?;
                         c.launch(f.gdn_fwd, (nv as u32, b as u32), g.dv as u32, 0, kargs!(cq, z, a, bb, alog, dtb, nw, of, t_i, nv_i, nk_i, geps, seq0))?;
-                        c.gemm(true, false, hsz, n, vd, 1.0, wo, vd, of, vd, 0.0, ao, hsz, mode)?;
+                        let oo = bop(c, s, &f, of, n * vd, "bfy", mode)?;
+                        c.gemm(true, false, hsz, n, vd, 1.0, wo, vd, oo, vd, 0.0, ao, hsz, mode)?;
                     }
                     prof.mark(c, "fwd.gdn");
                 }
@@ -1233,18 +1311,20 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                 }
             }
             let inter = l.inter;
-            let wgu = s.weight(l.gu)?;
-            let wdn = s.weight(l.down)?;
+            let wgu = s.wm(l.gu, mode)?;
+            let wdn = s.wm(l.down, mode)?;
             let gain = s.up(c, "rgain", l.gain)?;
             let both = if st.grad { s.saves[li].2.ptr } else { s.scr("rboth", n * 2 * inter * 4)? };
             let (in_i, one) = (inter as i32, 1i32);
             unsafe {
                 c.launch(f.add, gh, 256, 0, kargs!(h, ao, h1, tot_h))?;
                 c.launch(f.rmsnorm, (n as u32, 1), 256, 0, kargs!(h1, pln, nrm, inv2, hsz_i, eps, gm))?;
-                c.gemm(true, false, 2 * inter, n, hsz, 1.0, wgu, hsz, nrm, hsz, 0.0, both, 2 * inter, mode)?;
+                let xo = bop(c, s, &f, nrm, n * hsz, "bfx", mode)?;
+                c.gemm(true, false, 2 * inter, n, hsz, 1.0, wgu, hsz, xo, hsz, 0.0, both, 2 * inter, mode)?;
                 let tot = (n * inter) as u64;
                 c.launch(f.ffn_act, (tot.div_ceil(256) as u32, 1), 256, 0, kargs!(both, gain, act, n_i, in_i, gelu, one))?;
-                c.gemm(true, false, hsz, n, inter, 1.0, wdn, inter, act, inter, 0.0, ao, hsz, mode)?;
+                let actb = bop(c, s, &f, act, n * inter, "bfy", mode)?;
+                c.gemm(true, false, hsz, n, inter, 1.0, wdn, inter, actb, inter, 0.0, ao, hsz, mode)?;
                 c.launch(f.add, gh, 256, 0, kargs!(h1, ao, h, tot_h))?;
             }
             prof.mark(c, "fwd.ffn");
@@ -1270,12 +1350,12 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             while r0 < k {
                 let nb = band.min(k - r0);
                 let xp = hs + (r0 * hsz * 4) as u64;
-                c.gemm(true, false, vocab, nb, hsz, 1.0, wl, hsz, xp, hsz, 0.0, logits, vocab, mode)?;
+                c.gemm(true, false, vocab, nb, hsz, 1.0, wl, hsz, xp, hsz, 0.0, logits, vocab, amode)?;
                 let (tp, np, ap) = (tgb.ptr + (r0 * 4) as u64, nll + (r0 * 4) as u64, arg + (r0 * 4) as u64);
                 c.launch(f.ce_rows, (nb as u32, 1), 1024, 0, kargs!(logits, tp, np, ap, v_i, scale, gr))?;
                 if st.grad {
                     let dp = dhs + (r0 * hsz * 4) as u64;
-                    c.gemm(false, false, hsz, nb, vocab, 1.0, wl, hsz, logits, vocab, 0.0, dp, hsz, mode)?;
+                    c.gemm(false, false, hsz, nb, vocab, 1.0, wl, hsz, logits, vocab, 0.0, dp, hsz, amode)?;
                 }
                 r0 += nb;
             }
@@ -1302,8 +1382,8 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
             }
             for (li, l) in st.layers.iter().enumerate().rev() {
                 let inter = l.inter;
-                let wgu = s.weight(l.gu)?;
-                let wdn = s.weight(l.down)?;
+                let wgu = s.wm(l.gu, mode)?;
+                let wdn = s.wm(l.down, mode)?;
                 let gain = s.up(c, "rgain", l.gain)?;
                 let pln = s.up(c, "rpln", l.pln)?;
                 let (h1, inv2, both) = (s.saves[li].0.ptr, s.saves[li].1.ptr, s.saves[li].2.ptr);
@@ -1312,9 +1392,11 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
                 let acc = 1i32;
                 unsafe {
                     // dact2 = dh·down; mask grad, dgu; dn2 = dgu·gu
-                    c.gemm(false, false, inter, n, hsz, 1.0, wdn, inter, dh, hsz, 0.0, dact, inter, mode)?;
+                    let dho = bop(c, s, &f, dh, n * hsz, "bfx", mode)?;
+                    c.gemm(false, false, inter, n, hsz, 1.0, wdn, inter, dho, hsz, 0.0, dact, inter, mode)?;
                     c.launch(f.ffn_act_bwd, (inter.div_ceil(256) as u32, n.div_ceil(64) as u32), 256, 0, kargs!(both, dact, gain, dgu, dml, n_i, in_i, gelu, one, rows))?;
-                    c.gemm(false, false, hsz, n, 2 * inter, 1.0, wgu, hsz, dgu, 2 * inter, 0.0, dn2, hsz, mode)?;
+                    let dguo = bop(c, s, &f, dgu, n * 2 * inter, "bfy", mode)?;
+                    c.gemm(false, false, hsz, n, 2 * inter, 1.0, wgu, hsz, dguo, 2 * inter, 0.0, dn2, hsz, mode)?;
                     // dh1 = dh + post-norm backward (dh accumulates in place);
                     // without through_attn the frozen attention passes dh1
                     // straight to dh_in
@@ -1359,6 +1441,20 @@ pub fn bake_phase_a(st: &BkStep) -> Option<BkOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host rounding of the bf16 weight copies: nearest, ties to even,
+    /// NaN stays NaN (the kernel `bk_to_bf16` is the same expression).
+    #[test]
+    fn bf16_bits_round_to_nearest_even() {
+        assert_eq!(bf16_bits(1.0), 0x3f80);
+        assert_eq!(bf16_bits(-2.5), 0xc020);
+        assert_eq!(bf16_bits(f32::from_bits(0x3f80_8000)), 0x3f80); // tie, even stays
+        assert_eq!(bf16_bits(f32::from_bits(0x3f81_8000)), 0x3f82); // tie, odd rounds up
+        assert_eq!(bf16_bits(f32::from_bits(0x3f80_8001)), 0x3f81); // above the tie
+        assert_eq!(bf16_bits(f32::INFINITY), 0x7f80);
+        assert!(bf16_bits(f32::NAN) & 0x7fff > 0x7f80);
+        assert_eq!(bf16_bits(f32::from_bits(0x7f7f_ffff)), 0x7f80); // the largest f32 rounds to inf
+    }
 
     fn rnd(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;

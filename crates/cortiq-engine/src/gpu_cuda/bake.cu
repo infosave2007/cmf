@@ -494,6 +494,19 @@ extern "C" __global__ void bk_rmsnorm_bwd(const float* x, const float* w, const 
     }
 }
 
+// f32 -> bf16 over n values, rounded to nearest even (NaN kept quiet): the
+// activation operand of a bf16 weight GEMM in the resident step.
+extern "C" __global__ void bk_to_bf16(const float* __restrict__ x, unsigned short* __restrict__ y, long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned int u = __float_as_uint(x[i]);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        y[i] = (unsigned short)((u >> 16) | 0x40u);
+        return;
+    }
+    y[i] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
 // y = a + b (n elements)
 extern "C" __global__ void bk_add(const float* a, const float* b, float* y, long n) {
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

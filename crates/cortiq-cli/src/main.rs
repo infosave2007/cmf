@@ -4308,6 +4308,13 @@ enum SkillCmd {
         /// Output skill file
         #[arg(short, long)]
         output: String,
+        /// A soft-folded skill (`skill bake --soft-fold --no-defrag`) stored as
+        /// its per-neuron gains instead of the folded down_proj tensors: the
+        /// bake's checkpoint JSON whose `selected_logits` made the specialist.
+        /// Every changed tensor must be rebuilt from the base byte for byte, or
+        /// the export refuses; `skill apply` rebuilds them
+        #[arg(long)]
+        gains_from: Option<String>,
     },
     /// Attach a standalone skill file to its base: verify the identity
     /// keys, overlay the tensors and masks, write the specialist
@@ -7173,7 +7180,8 @@ async fn main() -> anyhow::Result<()> {
                 id,
                 name,
                 output,
-            } => skill::run_skill_export(&specialist, &base, &id, name.as_deref(), &output),
+                gains_from,
+            } => skill::run_skill_export(&specialist, &base, &id, name.as_deref(), &output, gains_from.as_deref()),
             SkillCmd::Apply {
                 base,
                 skill,
