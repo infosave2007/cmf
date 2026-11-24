@@ -507,11 +507,23 @@ extern "C" __global__ void bk_to_bf16(const float* __restrict__ x, unsigned shor
     y[i] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-// The output masks of every Linear (`--mask-scope linear`, the DTG-MA notebooks' DTGMALinear): a projection's
-// output [n][m] times its gain sigma(mask) per column. y = x * g (y may be x).
-extern "C" __global__ void bk_mul_cols(const float* x, const float* g, float* y, long n, int m) {
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n * (long)m) y[i] = x[i] * g[i % m];
+// The output masks of every Linear (`--mask-scope linear`, the DTG-MA notebooks' DTGMALinear).
+// A projection's weight [rows][cols] with each output row r scaled by g[r], once a step: the output masks
+// ride in the weights instead of on every output (y = (diag(g) W) x), f32 and bf16 copies.
+extern "C" __global__ void bk_scale_rows(const float* __restrict__ w, const float* __restrict__ g, float* __restrict__ y, int cols) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const long i = (long)blockIdx.y * cols + c;
+    y[i] = w[i] * g[blockIdx.y];
+}
+
+extern "C" __global__ void bk_scale_rows_bf16(const unsigned short* __restrict__ w, const float* __restrict__ g,
+                                              unsigned short* __restrict__ y, int cols) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    const long i = (long)blockIdx.y * cols + c;
+    const unsigned int u = __float_as_uint(__uint_as_float((unsigned int)w[i] << 16) * g[blockIdx.y]);
+    y[i] = (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
 // The gain gradient sum_r y[r][j] * dy[r][j] in two passes, in a fixed order (no atomics: a step stays

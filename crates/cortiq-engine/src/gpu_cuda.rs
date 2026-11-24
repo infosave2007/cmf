@@ -1594,6 +1594,65 @@ impl Ctx {
 }
 
 impl Ctx {
+    /// [`Ctx::sgemm_batched`] with the operands rounded to TF32 inside (the
+    /// tensor cores): the skill bake's GDN chunk products when it runs off
+    /// strict f32.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn sgemm_batched_tf32(
+        &self,
+        ta: bool,
+        tb: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: u64,
+        lda: usize,
+        stride_a: usize,
+        b: u64,
+        ldb: usize,
+        stride_b: usize,
+        beta: f32,
+        cptr: u64,
+        ldc: usize,
+        stride_c: usize,
+        count: usize,
+    ) -> Res<()> {
+        let op = |t| if t { bl::cublasOperation_t::CUBLAS_OP_T } else { bl::cublasOperation_t::CUBLAS_OP_N };
+        let ty = bl::cudaDataType::CUDA_R_32F;
+        let s = unsafe {
+            bl::cublasGemmStridedBatchedEx(
+                self.blas,
+                op(ta),
+                op(tb),
+                m as i32,
+                n as i32,
+                k as i32,
+                std::ptr::from_ref(&alpha).cast(),
+                a as *const c_void,
+                ty,
+                lda as i32,
+                stride_a as i64,
+                b as *const c_void,
+                ty,
+                ldb as i32,
+                stride_b as i64,
+                std::ptr::from_ref(&beta).cast(),
+                cptr as *mut c_void,
+                ty,
+                ldc as i32,
+                stride_c as i64,
+                count as i32,
+                bl::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+                bl::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        };
+        if s as u32 != 0 {
+            return Err(format!("cuBLAS batched tf32 gemm {count}×{m}x{n}x{k}: {s:?}"));
+        }
+        Ok(())
+    }
+
     /// `count` plain f32 GEMMs of one shape, `C = α·op(A)·op(B) + β·C`
     /// (column-major, as cuBLAS reads the arrays): operand i sits `stride`
     /// elements after operand i - 1.

@@ -4494,9 +4494,9 @@ enum SkillCmd {
         /// of refusing the corpus; records are never cut.
         #[arg(long)]
         drop_oversize: bool,
-        /// Pad chat records to the smallest of chunk/4, chunk/2, 3·chunk/4,
-        /// chunk they fit instead of the full chunk; batches are drawn
-        /// from equal-length records
+        /// Pad chat records to their length rounded up to 32 tokens (at most
+        /// the chunk) instead of the full chunk; batches are drawn from
+        /// equal-length records
         #[arg(long)]
         length_buckets: bool,
         /// Start from the mask of a previous run's --archaeology-report

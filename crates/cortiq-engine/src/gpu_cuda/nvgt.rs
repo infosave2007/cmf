@@ -171,6 +171,9 @@ struct Dev {
     f: F,
     /// None: the caller already holds the context's lock (`bake_gdn_bwd`).
     _g: Option<std::sync::MutexGuard<'static, State>>,
+    /// The GDN chunk products on TF32 (the skill bake off strict f32); the
+    /// trainer keeps them f32.
+    tf32: bool,
 }
 
 fn enter() -> Result<Dev, String> {
@@ -179,7 +182,7 @@ fn enter() -> Result<Dev, String> {
     c.current()?;
     let mut fg = FUNCS.lock().unwrap();
     let f = fg.get_or_insert_with(|| FBox(build(c))).0.clone()?;
-    Ok(Dev { c, f, _g: Some(g) })
+    Ok(Dev { c, f, _g: Some(g), tf32: false })
 }
 
 /// The card is up and the trainer's kernels compile on it.
@@ -423,7 +426,13 @@ impl Dev {
     #[allow(clippy::too_many_arguments)]
     unsafe fn mmb2(&self, ta: bool, tb: bool, m: usize, n: usize, k: usize, a: u64, lda: usize, sa: usize, b: u64, ldb: usize, sb: usize, beta: f32, cp: u64, ldc: usize, sc: usize, count: usize) -> Res<()> {
         let ev = self.kt_begin();
-        let r = unsafe { self.c.sgemm_batched(ta, tb, m, n, k, 1.0, a, lda, sa, b, ldb, sb, beta, cp, ldc, sc, count) };
+        let r = unsafe {
+            if self.tf32 {
+                self.c.sgemm_batched_tf32(ta, tb, m, n, k, 1.0, a, lda, sa, b, ldb, sb, beta, cp, ldc, sc, count)
+            } else {
+                self.c.sgemm_batched(ta, tb, m, n, k, 1.0, a, lda, sa, b, ldb, sb, beta, cp, ldc, sc, count)
+            }
+        };
         self.kt_end(ev, (4, "cublas gemm batched (gdn chunks)"));
         r
     }
@@ -1859,7 +1868,7 @@ pub(super) unsafe fn bake_gdn_bwd(
 ) -> Res<()> {
     let (nb, t, nv, nk, kk, eps) = geom;
     let f = FUNCS.lock().unwrap().get_or_insert_with(|| FBox(build(c))).0.clone()?;
-    let d = Dev { c, f, _g: None };
+    let d = Dev { c, f, _g: None, tf32: !crate::gpu_wgpu::bake_f32_strict() };
     let g = GdnG { nb, t, nv, nk, kk, eps };
     let p = GdnP { a_log: prm[0], dt_bias: prm[1], norm: prm[2], conv: prm[3] };
     static WORK: Mutex<Option<BakeGdnWork>> = Mutex::new(None);
@@ -1874,6 +1883,32 @@ pub(super) unsafe fn bake_gdn_bwd(
         gdn_core_fwd(&d, g, p, raw, z, a, b, w.pre.ptr, w.cq.ptr, w.out.ptr, Some(&sc))?;
         gdn_core_bwd(&d, g, p, z, a, b, w.pre.ptr, w.cq.ptr, dout, draw, dz, da, db, &sc, true)
     }
+}
+
+/// A GDN layer's forward for the skill bake's resident step on this module's
+/// kernels (`nt_gdn_fwd`, a column of the state over GC threads in
+/// registers): conv + SiLU into `pre` / `cq`, the recurrence and the gated
+/// norm into `out`, no states kept. The bake's own `bk_gdn_fwd` walks a whole
+/// column per thread and spills it (4.9 against 4.1 ms a layer at 32 × 128).
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn bake_gdn_fwd_dev(
+    c: &'static Ctx,
+    geom: (usize, usize, usize, usize, usize, f32),
+    prm: [u64; 4],
+    raw: u64,
+    z: u64,
+    a: u64,
+    b: u64,
+    pre: u64,
+    cq: u64,
+    out: u64,
+) -> Res<()> {
+    let (nb, t, nv, nk, kk, eps) = geom;
+    let f = FUNCS.lock().unwrap().get_or_insert_with(|| FBox(build(c))).0.clone()?;
+    let d = Dev { c, f, _g: None, tf32: !crate::gpu_wgpu::bake_f32_strict() };
+    let g = GdnG { nb, t, nv, nk, kk, eps };
+    let p = GdnP { a_log: prm[0], dt_bias: prm[1], norm: prm[2], conv: prm[3] };
+    unsafe { gdn_core_fwd(&d, g, p, raw, z, a, b, pre, cq, out, None) }
 }
 
 /// `bake_gdn_bwd`'s scratch for (sequences, positions, v-heads, k-heads), as

@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3060, 750 steps of 8 records, the 2000 dair-ai/emotion test texts through `serve` with the overlay: one-word
   answer 89.2 → 90.6 %, JSON answer 90.6 → 91.3 % against the FFN-neuron mask (LoRA r=16 on every linear
   layer, 43 MB: 91.6 / 92.0 %); 0.18–0.34 s a step. With every gate at 1 the step reproduces the base.
+
+### Changed
+- `skill bake` on CUDA, faster resident step (Qwen3.5-0.8B, `--mask-scope linear`, 32 JSON records a step,
+  RTX 3060: 1247 → 855 ms): the output masks ride in row-scaled weight copies made once a step instead of
+  scaling every projection's output and gradient (`bk_scale_rows`); the GDN forward runs on the NVG
+  trainer's kernel (`nt_gdn_fwd`, a state column over four threads in registers, 4.1 against 4.9 ms a layer);
+  the GDN chunk products of the backward take TF32 when Phase A is off strict f32 (`CMF_BAKE_A_STRICT=0`;
+  the NVG trainer keeps f32); `--length-buckets` pads a record to its length rounded up to 32 tokens
+  instead of a quarter-chunk bucket (87-token records went to 128). `CMF_BAKE_KT=<n>` times every kernel
+  of the n-th training step.
 - `skill export --gains-from CKPT.json`: a soft-folded skill (`skill bake --soft-fold --no-defrag`) stored as
   its per-neuron gains — one f32 per FFN neuron of each changed `down_proj`, σ(logit) from the bake's
   checkpoint, 0 for a closed neuron — instead of the folded tensors. The export rebuilds each changed down_proj

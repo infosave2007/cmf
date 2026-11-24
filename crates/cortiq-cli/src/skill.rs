@@ -1583,15 +1583,14 @@ fn focused_chat_record_chunks(
             );
             if ids.len() < chunk {
                 stats.padded_records += 1;
-                // Length buckets: pad to the smallest of chunk/4 … chunk
-                // (64-aligned) the record fits — the trainer batches equal
-                // lengths, so a short record no longer costs a full chunk.
+                // Length buckets: pad to the record's length rounded up to
+                // 32 (at most the chunk) — the trainer batches equal lengths,
+                // so a record costs its own width, not a quarter-chunk bucket
+                // (64-aligned buckets padded 87-token records to 128: a
+                // quarter of every product was padding). Right padding never
+                // reaches a record's own positions: its scores do not change.
                 let width = if length_buckets {
-                    (1..=4)
-                        .map(|k| (chunk * k / 4).div_ceil(64) * 64)
-                        .find(|&w| w >= ids.len())
-                        .unwrap_or(chunk)
-                        .min(chunk)
+                    ids.len().div_ceil(32).saturating_mul(32).clamp(32, chunk)
                 } else {
                     chunk
                 };
