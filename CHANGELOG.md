@@ -88,10 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - wgpu, looped mHC stacks (SenseNova-Loop): on a card whose weight budget holds only part of the stack, the
-  token and batch graphs ran a device prefix that could end inside an mHC range, and the host continued from
-  stale streams while the live ones sat on the card — garbage after the first token, with drafts and
-  without (reported on Windows; a 4-5 GB budget under SenseNova-Loop-9B cut at 38 or 46 of 56 layers). A
-  prefix now ends before the range's first layer (28 of 56 there), and the answer is the full graph's.
+  token and batch graphs run a device prefix and the host the rest; a cut inside an mHC range left the host's
+  layers on stale streams while the live ones sat on the card — garbage after the first token, with drafts and
+  without (reported on Windows). The host's layers now start from the card's streams, read back at the cut
+  (the token's, or a prompt chunk's rows), and the prefix stays where the budget puts it. Apple M4 over wgpu,
+  SenseNova-Loop-9B q4tp under a 4.2 / 5 GB budget (prefix 38 / 46 of 56 layers): the whole graph's answer.
 - `skill bake --through-attn` on Vulkan: the wgpu `gemm_dx` wrote its product over dX where the contract (and the
   CPU and CUDA twins) is dX += dY·W, so a GDN layer's four projections kept only the last one's gradient
   (Qwen3.5-0.8B: held-out PPL 2.764 after 4 steps against 2.441 on CPU and CUDA).

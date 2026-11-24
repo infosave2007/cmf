@@ -30841,11 +30841,14 @@ pub fn forward_token_graph(
         }
     }
     if prefix {
-        // A prefix never stops inside an mHC range: the host would continue
-        // from stale streams while the live ones sit on the card (a 4-5 GB
-        // budget under SenseNova-Loop-9B cut at 38 or 46 of 56 layers and
-        // wrote garbage). The range then runs on the host from its first layer.
-        while !lws.is_empty() && layers.get(lws.len()).is_some_and(|l| l.mhc.is_some_and(|m| !m.enter)) {
+        // A prefix that ends inside a two-stream mHC range hands its streams
+        // to the host (`gpu::mhc_streams_read`); the four-stream form keeps
+        // them in buffers the host does not read, so its prefix stops before
+        // the range instead. (Without either, a 4-5 GB budget under
+        // SenseNova-Loop-9B cut at 38 or 46 of 56 layers and wrote garbage.)
+        while !lws.is_empty()
+            && layers.get(lws.len()).is_some_and(|l| l.mhc.is_some_and(|m| !m.enter && m.dsv4.is_some()))
+        {
             lws.pop();
         }
         if lws.is_empty() {
@@ -37384,8 +37387,8 @@ pub fn forward_batch_graph_at(
             bgraph_refused("one layer exceeds the weight budget");
             return batch_outcome(o1_started || state_started, false);
         }
-        // Nor inside an mHC range (as the token graph's prefix above).
-        while run_n > 0 && layers.get(run_n).is_some_and(|l| l.mhc.is_some_and(|m| !m.enter)) {
+        // A four-stream mHC range is not cut midway (as the token graph's prefix above).
+        while run_n > 0 && layers.get(run_n).is_some_and(|l| l.mhc.is_some_and(|m| !m.enter && m.dsv4.is_some())) {
             run_n -= 1;
         }
         if run_n == 0 {
@@ -56650,6 +56653,14 @@ fn o1_qcap_buffer(c: &Ctx, layer: usize, positions: &[usize], row: usize) -> Opt
         q.bufs.push((layer, floats, b.clone()));
         Some(QCapSlot { buf: b, dst, row })
     })
+}
+
+/// The two-stream mHC streams the last graph left on the card for its first `rows` rows
+/// (`[rows][2][d]`): a device prefix that ended inside the range hands them to the host.
+pub fn mhc_streams_read(d: usize, rows: usize) -> Option<Vec<f32>> {
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    mhc::read_streams(c, d, rows)
 }
 
 /// The accepted rows of a verify: the sealed layers' state moves over them.

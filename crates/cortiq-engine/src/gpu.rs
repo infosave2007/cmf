@@ -3350,6 +3350,16 @@ pub fn o1_qcap_begin(_layers: &[usize]) -> bool {
     false
 }
 
+/// The two-stream mHC streams a wgpu device prefix left on the card for its first `rows`
+/// rows (`[rows][2][d]`), for a host tail that continues inside the range. None elsewhere.
+pub fn mhc_streams_read(_d: usize, _rows: usize) -> Option<Vec<f32>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::mhc_streams_read(_d, _rows);
+    }
+    None
+}
+
 /// Ask the armed capture for one row in `stride` by position, the rows a
 /// seal's trace keeps. True: the drains hand back those rows alone; false:
 /// every row, as before.
