@@ -547,10 +547,75 @@ extern "C" __global__ void bk_attn_prep(const float* qkv, const float* qn, const
         for (int j = c; j < hd; j += blockDim.x) vp[(long)r * kvdim + head * hd + j] = row[qrows + kvdim + head * hd + j];
 }
 
+// bk_attn_prep's backward: dqrot, dkrot (rotated, normed space), dv and dgate
+// back to dqkv [n][fused] in the projection layout (overwritten). RoPE is a
+// rotation (its transpose undoes it); the per-head RMSNorm's backward is
+// dx = inv·w'·dy − x·inv³/hd·Σ dy·w'·x, x the raw projection read from qkv.
+extern "C" __global__ void bk_attn_prep_bwd(const float* qkv, const float* qn, const float* kn, const float* rope,
+                                            const float* dqrot, const float* dkrot, const float* dv, const float* dgate,
+                                            float* dqkv, int t, int nh, int nkv, int hd, int half, int gated, float eps,
+                                            int gemma, int has_qn, int has_kn) {
+    const int r = blockIdx.x, hh = blockIdx.y, c = threadIdx.x;
+    const int qdim = nh * hd, kvdim = nkv * hd, qrows = gated ? 2 * qdim : qdim, fused = qrows + 2 * kvdim;
+    const float* row = qkv + (long)r * fused;
+    float* drow = dqkv + (long)r * fused;
+    const int pos = r % t;
+    __shared__ float x[512];
+    __shared__ float dy[512];
+    __shared__ float red[32];
+    const bool isq = hh < nh;
+    const int head = isq ? hh : hh - nh;
+    const int off = isq ? (gated ? 2 * head * hd : head * hd) : qrows + head * hd;
+    const float* nw = isq ? qn : kn;
+    const int has = isq ? has_qn : has_kn;
+    const float* dsrc = isq ? dqrot + (long)r * qdim + head * hd : dkrot + (long)r * kvdim + head * hd;
+    for (int j = c; j < hd; j += blockDim.x) x[j] = row[off + j];
+    // RoPE transposed: (dy_i, dy_{i+h}) = (do_i·cs + do_{i+h}·sn, −do_i·sn + do_{i+h}·cs)
+    for (int j = c; j < hd; j += blockDim.x) {
+        float v = dsrc[j];
+        if (j < 2 * half) {
+            const int i = j < half ? j : j - half;
+            const float cs = rope[((long)pos * half + i) * 2], sn = rope[((long)pos * half + i) * 2 + 1];
+            v = j < half ? dsrc[i] * cs + dsrc[i + half] * sn : -dsrc[i] * sn + dsrc[i + half] * cs;
+        }
+        dy[j] = v;
+    }
+    __syncthreads();
+    if (has) {
+        float ss = 0.f, sd = 0.f;
+        for (int j = c; j < hd; j += blockDim.x) {
+            ss += x[j] * x[j];
+            sd += dy[j] * (gemma ? 1.f + nw[j] : nw[j]) * x[j];
+        }
+        ss = bk_block_sum(ss, red);
+        __syncthreads();
+        sd = bk_block_sum(sd, red);
+        const float inv = rsqrtf(ss / hd + eps);
+        const float k = sd * inv * inv * inv / hd;
+        for (int j = c; j < hd; j += blockDim.x) drow[off + j] = inv * (gemma ? 1.f + nw[j] : nw[j]) * dy[j] - x[j] * k;
+    } else {
+        for (int j = c; j < hd; j += blockDim.x) drow[off + j] = dy[j];
+    }
+    if (isq && gated)
+        for (int j = c; j < hd; j += blockDim.x) drow[2 * head * hd + hd + j] = dgate[(long)r * qdim + head * hd + j];
+    if (!isq)
+        for (int j = c; j < hd; j += blockDim.x) drow[qrows + kvdim + head * hd + j] = dv[(long)r * kvdim + head * hd + j];
+}
+
 // ao ← ao·σ(gate) (n elements)
 extern "C" __global__ void bk_gate_mul(float* ao, const float* gate, long n) {
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) ao[i] *= bk_sigmoid(gate[i]);
+}
+
+// bk_gate_mul's backward: d ← d·σ(g) (in place, the pre-gate ao's gradient),
+// dgate = d·ao·σ(g)(1 − σ(g)), from ao before the gate.
+extern "C" __global__ void bk_gate_bwd(float* d, const float* ao, const float* gate, float* dgate, long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float s = bk_sigmoid(gate[i]);
+    dgate[i] = d[i] * ao[i] * s * (1.f - s);
+    d[i] *= s;
 }
 
 // dst[k] = src[rows[k]] (row width d)

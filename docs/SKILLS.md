@@ -265,7 +265,17 @@ prompt; 100 test equations with the training coefficients, 100 with coefficients
 | skill, soft mask, `--through-attn` | 84 % | 80 % |
 
 On new coefficients the skill solves 80 of 80 equations of the four kinds whose coefficients vary in training,
-and none of `y'' + k²y = 0`, which training showed with k = 1 only.
+and none of `y'' + k²y = 0`, which training showed with k = 1 only. Qwen3.5-0.8B (q8_2f, the skill served on an
+RTX 3060 through its overlay) gets that one too:
+
+| Qwen3.5-0.8B | training coefficients | new coefficients |
+|---|---:|---:|
+| the base model, chat template, 300 tokens | 66 % | 44 % |
+| skill, soft mask, `--through-attn` | 84 % | 96 % |
+
+On CUDA the resident step takes `--through-attn`: the 510-step bake runs in 67 s on Qwen3-0.6B and 183 s on
+Qwen3.5-0.8B (RTX 3060), and the skill decodes at the base's speed. On a discrete Vulkan card (`CMF_GPU=1`) the
+step is resident too: the same bake runs in 97 s and 127 s and reaches the same best held-out PPL.
 
 ```sh
 cortiq skill bake model.cmf --files train.txt --held-files held.txt --held 16 --calib-chunks 127 --chunk 64 \

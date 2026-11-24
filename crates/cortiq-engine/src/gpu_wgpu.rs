@@ -106,6 +106,7 @@ pub(crate) mod blr;
 pub use blr::blr_matmat;
 /// GatedDeltaNet forward and BPTT backward on the device (training).
 pub mod gdn_train;
+pub(crate) mod bake_res;
 
 /// The decode matvec, the prompt flash attention and the prompt GEMM as
 /// `shader_stats` builds them (driver registers and shared memory).
@@ -17762,6 +17763,471 @@ fn bake_attn_bwd_kv(@builtin(workgroup_id) wid: vec3<u32>,
 fn ab_p_nkv() -> u32 { return ak_p.nkv; }
 "#;
 
+/// The bake attention kernels on 32-wide subgroups (`bake_sg`, chosen at
+/// init): the same bindings, grid and results as `BAKE_ATTN_SRC`,
+/// `BAKE_ATTN_BWD_Q_SRC`, `BAKE_ATTN_BWD_KV_SRC`. A subgroup takes one key
+/// (or query) at a time with its lanes on vec4s of the head, so the dot
+/// products read rows whole and close with `subgroupAdd`, where a lane of the
+/// scalar kernels walked a strided row alone. RTX 3060, 4 × 64 tokens, 16:8
+/// heads of 128: forward 0.54 → 0.18 ms, q backward 1.67 → 0.33, kv backward
+/// 0.89 → 0.17; at 2 × 512 tokens the backward 90 → 11 ms; closer to f64.
+const BAKE_QKR_SG_SRC: &str = r#"
+struct QkrP {
+    n: u32, t: u32, nh: u32, nkv: u32,
+    hd: u32, qrows: u32, half: u32, flags: u32,
+    eps: f32, _a: u32, _b: u32, _c: u32,
+};
+@group(0) @binding(0) var<storage, read> qk_plane : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> qk_qnorm : array<f32>;
+@group(0) @binding(2) var<storage, read> qk_knorm : array<f32>;
+@group(0) @binding(3) var<storage, read> qk_bias : array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> qk_rope : array<f32>;
+@group(0) @binding(5) var<storage, read_write> qk_qrot : array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> qk_krot : array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> qk_vproj : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> qk_gate : array<vec4<f32>>;
+@group(0) @binding(9) var<storage, read_write> qk_qinv : array<f32>;
+@group(0) @binding(10) var<storage, read_write> qk_kinv : array<f32>;
+@group(0) @binding(11) var<uniform> qk_p : QkrP;
+
+const FL_GATED: u32 = 1u;
+const FL_QNORM: u32 = 2u;
+const FL_KNORM: u32 = 4u;
+const FL_GEMMA: u32 = 8u;
+
+fn nw(is_q: bool, c: u32) -> vec4<f32> {
+    var w: vec4<f32>;
+    if (is_q) { w = vec4<f32>(qk_qnorm[c], qk_qnorm[c + 1u], qk_qnorm[c + 2u], qk_qnorm[c + 3u]); }
+    else { w = vec4<f32>(qk_knorm[c], qk_knorm[c + 1u], qk_knorm[c + 2u], qk_knorm[c + 3u]); }
+    if ((qk_p.flags & FL_GEMMA) != 0u) { w = w + vec4<f32>(1.0); }
+    return w;
+}
+
+// components c … c+3 of a head starting at float `src` (bias at `boff`),
+// normed (scale `inv`, when `norm`) and rotated at position `pos`; the RoPE
+// partner c ± half is read again rather than shuffled
+fn head4(src: u32, boff: u32, c: u32, pos: u32, norm: bool, is_q: bool, inv: f32) -> vec4<f32> {
+    var x = qk_plane[(src + c) >> 2u] + qk_bias[(boff + c) >> 2u];
+    if (norm) { x = x * inv * nw(is_q, c); }
+    let half = qk_p.half;
+    if (c >= 2u * half) { return x; }
+    var pc: u32;
+    if (c < half) { pc = c + half; } else { pc = c - half; }
+    var y = qk_plane[(src + pc) >> 2u] + qk_bias[(boff + pc) >> 2u];
+    if (norm) { y = y * inv * nw(is_q, pc); }
+    let i = c % half;
+    let rb = (pos * half + i) * 2u;
+    let cs = vec4<f32>(qk_rope[rb], qk_rope[rb + 2u], qk_rope[rb + 4u], qk_rope[rb + 6u]);
+    let sn = vec4<f32>(qk_rope[rb + 1u], qk_rope[rb + 3u], qk_rope[rb + 5u], qk_rope[rb + 7u]);
+    if (c < half) { return x * cs - y * sn; }
+    return y * sn + x * cs;
+}
+
+// One 32-wide subgroup per (row, unit) — units run q-heads, then k-heads,
+// then v-heads — its lanes on vec4s of the head (two for hd 256); the q/k
+// RMSNorm's sum closes with subgroupAdd. Two units a workgroup, the grid
+// folded at 32 768 in x.
+@compute @workgroup_size(64)
+fn bake_qkr(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(local_invocation_index) lid: u32) {
+    let units = qk_p.nh + 2u * qk_p.nkv;
+    let pair = (wid.y * 32768u + wid.x) * 2u + lid / 32u;
+    if (pair >= qk_p.n * units) { return; }
+    let lane = lid % 32u;
+    let r = pair / units;
+    let u = pair % units;
+    let pos = r % qk_p.t;
+    let hd = qk_p.hd;
+    let kvdim = qk_p.nkv * hd;
+    let fused = qk_p.qrows + 2u * kvdim;
+    let base = r * fused;
+    let ca = lane * 4u;
+    let cb = 128u + lane * 4u;
+    let oka = ca < hd;
+    let okb = cb < hd;
+    if (u < qk_p.nh) {
+        let h = u;
+        let gated = (qk_p.flags & FL_GATED) != 0u;
+        var boff = h * hd;
+        if (gated) { boff = 2u * h * hd; }
+        let src = base + boff;
+        let norm = (qk_p.flags & FL_QNORM) != 0u;
+        var ss = 0.0;
+        if (norm) {
+            if (oka) { let x = qk_plane[(src + ca) >> 2u] + qk_bias[(boff + ca) >> 2u]; ss = dot(x, x); }
+            if (okb) { let x = qk_plane[(src + cb) >> 2u] + qk_bias[(boff + cb) >> 2u]; ss = ss + dot(x, x); }
+        }
+        ss = subgroupAdd(ss);
+        var inv = 1.0;
+        if (norm) { inv = 1.0 / sqrt(ss / f32(hd) + qk_p.eps); }
+        if (lane == 0u) { qk_qinv[r * qk_p.nh + h] = inv; }
+        let dst = r * qk_p.nh * hd + h * hd;
+        if (oka) { qk_qrot[(dst + ca) >> 2u] = head4(src, boff, ca, pos, norm, true, inv); }
+        if (okb) { qk_qrot[(dst + cb) >> 2u] = head4(src, boff, cb, pos, norm, true, inv); }
+        if (gated) {
+            if (oka) { qk_gate[(dst + ca) >> 2u] = qk_plane[(src + hd + ca) >> 2u] + qk_bias[(boff + hd + ca) >> 2u]; }
+            if (okb) { qk_gate[(dst + cb) >> 2u] = qk_plane[(src + hd + cb) >> 2u] + qk_bias[(boff + hd + cb) >> 2u]; }
+        }
+    } else if (u < qk_p.nh + qk_p.nkv) {
+        let g = u - qk_p.nh;
+        let boff = qk_p.qrows + g * hd;
+        let src = base + boff;
+        let norm = (qk_p.flags & FL_KNORM) != 0u;
+        var ss = 0.0;
+        if (norm) {
+            if (oka) { let x = qk_plane[(src + ca) >> 2u] + qk_bias[(boff + ca) >> 2u]; ss = dot(x, x); }
+            if (okb) { let x = qk_plane[(src + cb) >> 2u] + qk_bias[(boff + cb) >> 2u]; ss = ss + dot(x, x); }
+        }
+        ss = subgroupAdd(ss);
+        var inv = 1.0;
+        if (norm) { inv = 1.0 / sqrt(ss / f32(hd) + qk_p.eps); }
+        if (lane == 0u) { qk_kinv[r * qk_p.nkv + g] = inv; }
+        let dst = r * kvdim + g * hd;
+        if (oka) { qk_krot[(dst + ca) >> 2u] = head4(src, boff, ca, pos, norm, false, inv); }
+        if (okb) { qk_krot[(dst + cb) >> 2u] = head4(src, boff, cb, pos, norm, false, inv); }
+    } else {
+        let g = u - qk_p.nh - qk_p.nkv;
+        let boff = qk_p.qrows + kvdim + g * hd;
+        let src = base + boff;
+        let dst = r * kvdim + g * hd;
+        if (oka) { qk_vproj[(dst + ca) >> 2u] = qk_plane[(src + ca) >> 2u] + qk_bias[(boff + ca) >> 2u]; }
+        if (okb) { qk_vproj[(dst + cb) >> 2u] = qk_plane[(src + cb) >> 2u] + qk_bias[(boff + cb) >> 2u]; }
+    }
+}
+"#;
+
+/// The subgroup variants of the bake attention kernels (`BAKE_*_SG_SRC`).
+pub(crate) struct BakeSg {
+    pub(crate) qkr: wgpu::ComputePipeline,
+    pub(crate) head: wgpu::ComputePipeline,
+    pub(crate) bwd_q: wgpu::ComputePipeline,
+    pub(crate) bwd_kv: wgpu::ComputePipeline,
+}
+
+/// The bake attention kernels for one head geometry (`Ctx::bake_attn`).
+pub(crate) struct BakeAttn<'a> {
+    pub(crate) qkr: &'a wgpu::ComputePipeline,
+    /// `qkr` is the subgroup kernel: one subgroup a (row, unit), see `grid`.
+    pub(crate) qkr_sg: bool,
+    pub(crate) head: &'a wgpu::ComputePipeline,
+    pub(crate) bwd_q: &'a wgpu::ComputePipeline,
+    pub(crate) bwd_kv: &'a wgpu::ComputePipeline,
+}
+
+impl BakeAttn<'_> {
+    /// `qkr`'s grid for `pairs` (row, unit) pairs.
+    pub(crate) fn qkr_grid(&self, pairs: usize) -> (u32, u32, u32) {
+        if self.qkr_sg {
+            let wgs = pairs.div_ceil(2) as u32;
+            (wgs.min(32_768), wgs.div_ceil(32_768), 1)
+        } else {
+            ((pairs as u32).div_ceil(64), 1, 1)
+        }
+    }
+}
+
+impl Ctx {
+    /// The bake attention kernels for heads of `hd` and a RoPE half of
+    /// `half`: the subgroup ones where the device has them and the head
+    /// splits into vec4s (`hd % 4`, `half % 4` for the norm+RoPE kernel), the
+    /// scalar ones otherwise.
+    pub(crate) fn bake_attn(&self, hd: usize, half: usize) -> BakeAttn<'_> {
+        match self.bake_sg.as_ref().filter(|_| hd % 4 == 0) {
+            Some(sg) => BakeAttn {
+                qkr: if half % 4 == 0 { &sg.qkr } else { &self.bake_qkr },
+                qkr_sg: half % 4 == 0,
+                head: &sg.head,
+                bwd_q: &sg.bwd_q,
+                bwd_kv: &sg.bwd_kv,
+            },
+            None => BakeAttn { qkr: &self.bake_qkr, qkr_sg: false, head: &self.bake_attn_head, bwd_q: &self.bake_attn_bwd_q, bwd_kv: &self.bake_attn_bwd_kv },
+        }
+    }
+}
+
+const BAKE_ATTN_SG_SRC: &str = r#"
+struct AtP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> at_q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> at_k : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> at_v : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> at_o : array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> at_p : AtP;
+
+var<workgroup> at_sc: array<f32, 2048>;
+var<workgroup> at_red: array<f32, 4>;
+var<workgroup> at_part: array<vec4<f32>, 256>;
+
+// One workgroup (four 32-wide subgroups) per (query row, sequence·head): the
+// scores a key per subgroup (lanes on vec4s of the head, subgroupAdd), the
+// softmax over the lanes, then o = Σ p·v with the subgroups on interleaved
+// keys and their partial sums added in subgroup order.
+@compute @workgroup_size(128)
+fn bake_attn_head(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let ti = wid.x;
+    let unit = wid.y;
+    let bi = unit / at_p.nh;
+    let h = unit % at_p.nh;
+    let rep = at_p.nh / at_p.nkv;
+    let g = h / rep;
+    let hd4 = at_p.hd / 4u;
+    let qd4 = at_p.nh * hd4;
+    let kv4 = at_p.nkv * hd4;
+    let scale = 1.0 / sqrt(f32(at_p.hd));
+    let lane = lid % 32u;
+    let sg = lid / 32u;
+    let qbase = (bi * at_p.t + ti) * qd4 + h * hd4;
+    let oka = lane < hd4;
+    let okb = lane + 32u < hd4;
+    var qa = vec4<f32>(); var qb = vec4<f32>();
+    if (oka) { qa = at_q[qbase + lane]; }
+    if (okb) { qb = at_q[qbase + 32u + lane]; }
+    var first = 0u;
+    if (at_p.window != 0u && ti + 1u > at_p.window) { first = ti + 1u - at_p.window; }
+    for (var j0 = first; j0 <= ti; j0 = j0 + 4u) {
+        let j = j0 + sg;
+        var s = 0.0;
+        if (j <= ti) {
+            let kb = (bi * at_p.t + j) * kv4 + g * hd4;
+            if (oka) { s = dot(qa, at_k[kb + lane]); }
+            if (okb) { s = s + dot(qb, at_k[kb + 32u + lane]); }
+        }
+        s = subgroupAdd(s);
+        if (j <= ti && lane == 0u) { at_sc[j] = s * scale; }
+    }
+    workgroupBarrier();
+    var lmx = -3.0e38;
+    for (var j = first + lid; j <= ti; j = j + 128u) { lmx = max(lmx, at_sc[j]); }
+    lmx = subgroupMax(lmx);
+    if (lane == 0u) { at_red[sg] = lmx; }
+    workgroupBarrier();
+    let mx = max(max(at_red[0], at_red[1]), max(at_red[2], at_red[3]));
+    workgroupBarrier();
+    var lsum = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let e = exp(at_sc[j] - mx);
+        at_sc[j] = e;
+        lsum = lsum + e;
+    }
+    lsum = subgroupAdd(lsum);
+    if (lane == 0u) { at_red[sg] = lsum; }
+    workgroupBarrier();
+    let den = at_red[0] + at_red[1] + at_red[2] + at_red[3];
+    var oa = vec4<f32>();
+    var ob = vec4<f32>();
+    for (var j0 = first; j0 <= ti; j0 = j0 + 4u) {
+        let j = j0 + sg;
+        if (j <= ti) {
+            let vb2 = (bi * at_p.t + j) * kv4 + g * hd4;
+            let p = vec4<f32>(at_sc[j] / den);
+            if (oka) { oa = fma(p, at_v[vb2 + lane], oa); }
+            if (okb) { ob = fma(p, at_v[vb2 + 32u + lane], ob); }
+        }
+    }
+    at_part[sg * 64u + lane] = oa;
+    at_part[sg * 64u + 32u + lane] = ob;
+    workgroupBarrier();
+    if (lid < hd4) {
+        at_o[qbase + lid] = ((at_part[lid] + at_part[64u + lid]) + at_part[128u + lid]) + at_part[192u + lid];
+    }
+}
+"#;
+
+const BAKE_ATTN_BWD_Q_SG_SRC: &str = r#"
+struct AbP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> ab_q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> ab_k : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> ab_v : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> ab_do : array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> ab_dq : array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> ab_stat : array<f32>;
+@group(0) @binding(6) var<uniform> ab_p : AbP;
+
+var<workgroup> abq_sc: array<f32, 2048>;
+var<workgroup> abq_dp: array<f32, 2048>;
+var<workgroup> abq_red: array<f32, 4>;
+var<workgroup> abq_part: array<vec4<f32>, 256>;
+
+// One workgroup (four 32-wide subgroups) per (query row, sequence·head): a
+// subgroup takes a key at a time, its lanes a vec4 of the head each (two for
+// hd 256), the dot products close with subgroupAdd; the row's softmax, D and
+// ds over the lanes; dq = Σ ds·k with the subgroups on interleaved keys and
+// their partial sums added in subgroup order.
+@compute @workgroup_size(128)
+fn bake_attn_bwd_q(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let ti = wid.x;
+    let unit = wid.y;
+    let bi = unit / ab_p.nh;
+    let h = unit % ab_p.nh;
+    let rep = ab_p.nh / ab_p.nkv;
+    let g = h / rep;
+    let hd4 = ab_p.hd / 4u;
+    let qd4 = ab_p.nh * hd4;
+    let kv4 = ab_p.nkv * hd4;
+    let scale = 1.0 / sqrt(f32(ab_p.hd));
+    let lane = lid % 32u;
+    let sg = lid / 32u;
+    let row = bi * ab_p.t + ti;
+    let qbase = row * qd4 + h * hd4;
+    let oka = lane < hd4;
+    let okb = lane + 32u < hd4;
+    var qa = vec4<f32>(); var qb = vec4<f32>(); var da = vec4<f32>(); var db = vec4<f32>();
+    if (oka) { qa = ab_q[qbase + lane]; da = ab_do[qbase + lane]; }
+    if (okb) { qb = ab_q[qbase + 32u + lane]; db = ab_do[qbase + 32u + lane]; }
+    var first = 0u;
+    if (ab_p.window != 0u && ti + 1u > ab_p.window) { first = ti + 1u - ab_p.window; }
+    // 1. s_j and dp_j = dao·v_j
+    for (var j0 = first; j0 <= ti; j0 = j0 + 4u) {
+        let j = j0 + sg;
+        var s = 0.0;
+        var dp = 0.0;
+        if (j <= ti) {
+            let kb = (bi * ab_p.t + j) * kv4 + g * hd4;
+            if (oka) { s = dot(qa, ab_k[kb + lane]); dp = dot(da, ab_v[kb + lane]); }
+            if (okb) { s = s + dot(qb, ab_k[kb + 32u + lane]); dp = dp + dot(db, ab_v[kb + 32u + lane]); }
+        }
+        s = subgroupAdd(s);
+        dp = subgroupAdd(dp);
+        if (j <= ti && lane == 0u) { abq_sc[j] = s * scale; abq_dp[j] = dp; }
+    }
+    workgroupBarrier();
+    // 2. max, denominator, D = Σ p·dp, then ds·scale in place
+    var lmx = -3.0e38;
+    for (var j = first + lid; j <= ti; j = j + 128u) { lmx = max(lmx, abq_sc[j]); }
+    lmx = subgroupMax(lmx);
+    if (lane == 0u) { abq_red[sg] = lmx; }
+    workgroupBarrier();
+    let mx = max(max(abq_red[0], abq_red[1]), max(abq_red[2], abq_red[3]));
+    workgroupBarrier();
+    var lsum = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let e = exp(abq_sc[j] - mx);
+        abq_sc[j] = e;
+        lsum = lsum + e;
+    }
+    lsum = subgroupAdd(lsum);
+    if (lane == 0u) { abq_red[sg] = lsum; }
+    workgroupBarrier();
+    let den = abq_red[0] + abq_red[1] + abq_red[2] + abq_red[3];
+    workgroupBarrier();
+    var ld = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let p = abq_sc[j] / den;
+        abq_sc[j] = p;
+        ld = ld + p * abq_dp[j];
+    }
+    ld = subgroupAdd(ld);
+    if (lane == 0u) { abq_red[sg] = ld; }
+    workgroupBarrier();
+    let dsum = abq_red[0] + abq_red[1] + abq_red[2] + abq_red[3];
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        abq_sc[j] = abq_sc[j] * (abq_dp[j] - dsum) * scale;
+    }
+    workgroupBarrier();
+    // 3. dq = Σ_j ds_j·k_j
+    var aa = vec4<f32>();
+    var ab = vec4<f32>();
+    for (var j0 = first; j0 <= ti; j0 = j0 + 4u) {
+        let j = j0 + sg;
+        if (j <= ti) {
+            let kb = (bi * ab_p.t + j) * kv4 + g * hd4;
+            let ds = vec4<f32>(abq_sc[j]);
+            if (oka) { aa = fma(ds, ab_k[kb + lane], aa); }
+            if (okb) { ab = fma(ds, ab_k[kb + 32u + lane], ab); }
+        }
+    }
+    abq_part[sg * 64u + lane] = aa;
+    abq_part[sg * 64u + 32u + lane] = ab;
+    workgroupBarrier();
+    if (lid < hd4) {
+        ab_dq[qbase + lid] = ((abq_part[lid] + abq_part[64u + lid]) + abq_part[128u + lid]) + abq_part[192u + lid];
+    }
+    if (lid == 0u) {
+        let sbase = (row * ab_p.nh + h) * 4u;
+        ab_stat[sbase] = mx;
+        ab_stat[sbase + 1u] = den;
+        ab_stat[sbase + 2u] = dsum;
+    }
+}
+"#;
+
+const BAKE_ATTN_BWD_KV_SG_SRC: &str = r#"
+struct AkP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> ak_q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> ak_k : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> ak_v : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> ak_do : array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> ak_stat : array<f32>;
+@group(0) @binding(5) var<storage, read_write> ak_dk : array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> ak_dv : array<vec4<f32>>;
+@group(0) @binding(7) var<uniform> ak_p : AkP;
+
+var<workgroup> akp_k: array<vec4<f32>, 256>;
+var<workgroup> akp_v: array<vec4<f32>, 256>;
+
+// One workgroup (four 32-wide subgroups) per (key row j, sequence·kv-group):
+// k_j and v_j in the lanes' registers, a subgroup takes a query of each head
+// of the group at a time — s and dp close with subgroupAdd, p and ds from the
+// q kernel's (max, den, D) — and the lanes fold ds·q and p·dao into dk_j, dv_j
+// at once; the four subgroups' partial sums are added in order at the end.
+@compute @workgroup_size(128)
+fn bake_attn_bwd_kv(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let j = wid.x;
+    let unit = wid.y;
+    let bi = unit / ak_p.nkv;
+    let g = unit % ak_p.nkv;
+    let rep = ak_p.nh / ak_p.nkv;
+    let hd4 = ak_p.hd / 4u;
+    let qd4 = ak_p.nh * hd4;
+    let kv4 = ak_p.nkv * hd4;
+    let scale = 1.0 / sqrt(f32(ak_p.hd));
+    let lane = lid % 32u;
+    let sg = lid / 32u;
+    let kb = (bi * ak_p.t + j) * kv4 + g * hd4;
+    let oka = lane < hd4;
+    let okb = lane + 32u < hd4;
+    var ka = vec4<f32>(); var kb2 = vec4<f32>(); var va = vec4<f32>(); var vb = vec4<f32>();
+    if (oka) { ka = ak_k[kb + lane]; va = ak_v[kb + lane]; }
+    if (okb) { kb2 = ak_k[kb + 32u + lane]; vb = ak_v[kb + 32u + lane]; }
+    var t_last = ak_p.t - 1u;
+    if (ak_p.window != 0u && j + ak_p.window - 1u < t_last) { t_last = j + ak_p.window - 1u; }
+    var dka = vec4<f32>(); var dkb = vec4<f32>(); var dva = vec4<f32>(); var dvb = vec4<f32>();
+    for (var h = g * rep; h < (g + 1u) * rep; h = h + 1u) {
+        for (var i0 = j; i0 <= t_last; i0 = i0 + 4u) {
+            let i = i0 + sg;
+            let row = bi * ak_p.t + i;
+            let qbase = row * qd4 + h * hd4;
+            var qa = vec4<f32>(); var qb = vec4<f32>(); var da = vec4<f32>(); var db = vec4<f32>();
+            var s = 0.0;
+            var dp = 0.0;
+            if (i <= t_last) {
+                if (oka) { qa = ak_q[qbase + lane]; da = ak_do[qbase + lane]; s = dot(qa, ka); dp = dot(da, va); }
+                if (okb) { qb = ak_q[qbase + 32u + lane]; db = ak_do[qbase + 32u + lane]; s = s + dot(qb, kb2); dp = dp + dot(db, vb); }
+            }
+            s = subgroupAdd(s);
+            dp = subgroupAdd(dp);
+            if (i <= t_last) {
+                let sb = (row * ak_p.nh + h) * 4u;
+                let p = exp(s * scale - ak_stat[sb]) / ak_stat[sb + 1u];
+                let ds = vec4<f32>(p * (dp - ak_stat[sb + 2u]) * scale);
+                let pv = vec4<f32>(p);
+                dka = fma(ds, qa, dka); dkb = fma(ds, qb, dkb);
+                dva = fma(pv, da, dva); dvb = fma(pv, db, dvb);
+            }
+        }
+    }
+    akp_k[sg * 64u + lane] = dka; akp_k[sg * 64u + 32u + lane] = dkb;
+    akp_v[sg * 64u + lane] = dva; akp_v[sg * 64u + 32u + lane] = dvb;
+    workgroupBarrier();
+    if (lid < hd4) {
+        ak_dk[kb + lid] = ((akp_k[lid] + akp_k[64u + lid]) + akp_k[128u + lid]) + akp_k[192u + lid];
+        ak_dv[kb + lid] = ((akp_v[lid] + akp_v[64u + lid]) + akp_v[128u + lid]) + akp_v[192u + lid];
+    }
+}
+"#;
+
 /// The bake attention chain, stage 1: from the fused qkv plane the coop
 /// GEMM left on the card — bias, per-head [q; gate] split, qk-RMSNorm
 /// (inv saved for the backward), RoPE from a HOST-precomputed cos/sin
@@ -20493,6 +20959,12 @@ pub struct Ctx {
     gemm_nt_coop: Option<wgpu::ComputePipeline>,
     /// Its backward twin (reduction over w's leading axis) for `gemm_dx_f32`.
     gemm_nn_coop: Option<wgpu::ComputePipeline>,
+    /// The same two GEMMs in plain f32 on the shader cores (`F32T_NT_SRC`,
+    /// `F32T_NN_SRC`: the coop kernels' bindings, parameters and 64×64
+    /// grid). The bake's strict-f32 phase and coop-less devices take them
+    /// where the f16-staged coop kernels may not run.
+    gemm_nt_f32t: wgpu::ComputePipeline,
+    gemm_nn_f32t: wgpu::ComputePipeline,
     /// silu(g)·u·scale between the chain's two GEMMs (plain f32 module).
     bake_silu: wgpu::ComputePipeline,
     /// Its backward: dact + the resident plane → concatenated dgu.
@@ -20510,6 +20982,9 @@ pub struct Ctx {
     /// The bake attention backward (dq; dk+dv) for full-layer FCD.
     bake_attn_bwd_q: wgpu::ComputePipeline,
     bake_attn_bwd_kv: wgpu::ComputePipeline,
+    /// The same four kernels on 32-wide subgroups, where the device has them
+    /// (`Ctx::bake_attn` picks per head geometry).
+    bake_sg: Option<BakeSg>,
     /// Per-layer gate+up planes the forward chain parks for the backward
     /// one — the resident graph's memory. Grow-only per layer; ~84 MB a
     /// layer at chunk size, discrete cards only.
@@ -23184,16 +23659,58 @@ fn init(dev: usize) -> Result<Ctx, String> {
             cache: pcache.as_ref(),
         })
     };
+    // The bake's f32 tile GEMMs and subgroup attention kernels guard every
+    // global index against the geometry their callers check (cols % 4, t ≤
+    // 2048, hd ≤ 256) and index their workgroup tiles in range by
+    // construction: built without naga's injected clamps, as the trainer's
+    // kernels are (`train_ops::trainer_module`) — the clamps kept the driver
+    // from folding the tiles' address arithmetic (RTX 3060: the head's NT
+    // GEMM 4.5 → 5.2 TFLOPS by this alone). `CMF_BAKE_CHECKED=1` builds them
+    // checked.
+    let bake_checked = std::env::var("CMF_BAKE_CHECKED").as_deref() == Ok("1");
+    let trusted = |src: &str, mod_label: &'static str, entry: &'static str| {
+        if bake_checked {
+            return plain(src, mod_label, entry);
+        }
+        let desc = wgpu::ShaderModuleDescriptor { label: Some(mod_label), source: wgpu::ShaderSource::Wgsl(src.into()) };
+        // SAFETY: see above.
+        let m = unsafe { device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked()) };
+        trace_pipeline(entry);
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: None,
+            module: &m,
+            entry_point: Some(entry),
+            compilation_options: pco(),
+            cache: pcache.as_ref(),
+        })
+    };
+    let gemm_nt_f32t = trusted(F32T_NT_SRC, "bake-nt-f32t", "gemm_nt_f32t");
+    let gemm_nn_f32t = trusted(F32T_NN_SRC, "bake-nn-f32t", "gemm_nn_f32t");
     let bake_silu = plain(BAKE_SILU_SRC, "bake-silu", "bake_silu_mul");
     let bake_silu_bwd = plain(BAKE_SILU_BWD_SRC, "bake-silu-bwd", "bake_silu_bwd");
     let bake_gelu = plain(BAKE_GELU_SRC, "bake-gelu", "bake_gelu_mul");
     let bake_gelu_bwd = plain(BAKE_GELU_BWD_SRC, "bake-gelu-bwd", "bake_gelu_bwd");
     let bake_mask_grad = plain(BAKE_MASKGRAD_SRC, "bake-mask-grad", "bake_mask_grad");
     let bake_qkr = plain(BAKE_QKR_SRC, "bake-qkr", "bake_qkr");
+    // The subgroup attention kernels want 32-wide subgroups (lane = vec4 of
+    // the head, four subgroups a workgroup) and 20.5 KB of workgroup memory;
+    // `CMF_BAKE_ATTN_SG=0` keeps the scalar ones (`Ctx::bake_attn`).
+    let bake_sg = device.features().contains(wgpu::Features::SUBGROUP)
+        && ((info.subgroup_min_size == 32 && info.subgroup_max_size == 32)
+            || (info.backend == wgpu::Backend::Metal && info.name.starts_with("Apple")))
+        && device.limits().max_compute_workgroup_storage_size >= 2 * 2048 * 4 + 16 + 256 * 16
+        && std::env::var("CMF_BAKE_ATTN_SG").as_deref() != Ok("0");
     let bake_attn_head = plain(BAKE_ATTN_SRC, "bake-attn", "bake_attn_head");
     let bake_attn_gate = plain(BAKE_AGATE_SRC, "bake-agate", "bake_attn_gate");
     let bake_attn_bwd_q = plain(BAKE_ATTN_BWD_Q_SRC, "bake-attn-bwd-q", "bake_attn_bwd_q");
     let bake_attn_bwd_kv = plain(BAKE_ATTN_BWD_KV_SRC, "bake-attn-bwd-kv", "bake_attn_bwd_kv");
+    let bake_sg = bake_sg.then(|| BakeSg {
+        qkr: trusted(BAKE_QKR_SG_SRC, "bake-qkr-sg", "bake_qkr"),
+        head: trusted(BAKE_ATTN_SG_SRC, "bake-attn-sg", "bake_attn_head"),
+        bwd_q: trusted(BAKE_ATTN_BWD_Q_SG_SRC, "bake-attn-bwd-q-sg", "bake_attn_bwd_q"),
+        bwd_kv: trusted(BAKE_ATTN_BWD_KV_SG_SRC, "bake-attn-bwd-kv-sg", "bake_attn_bwd_kv"),
+    });
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -24064,6 +24581,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         q4tp_mm_coop_f16_m128,
         gemm_nt_coop,
         gemm_nn_coop,
+        gemm_nt_f32t,
+        gemm_nn_f32t,
         bake_silu,
         bake_silu_bwd,
         bake_gelu,
@@ -24074,6 +24593,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         bake_attn_gate,
         bake_attn_bwd_q,
         bake_attn_bwd_kv,
+        bake_sg,
         bake_planes: Mutex::new(HashMap::new()),
         argmax_part,
         gdn_step_par,
@@ -54667,6 +55187,253 @@ fn gemm_nt_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// the B staging reads a column of w per output: four stride-`rows` loads
 /// where the forward kernel read four consecutive. Everything else —
 /// tiles, loads, the store — is the forward kernel unchanged.
+/// `gemm_nt_coop` in plain f32: y[nb][rows] = x[nb][cols]·w[rows][cols]ᵀ, a
+/// 64×64 tile a workgroup of 64 threads (8 × 8 outputs each), K in steps of
+/// 16 staged k-major in workgroup memory. A thread owns rows tm·4 … and
+/// 32 + tm·4 …, columns tn·4 … and 32 + tn·4 …, so a quarter-warp reads
+/// neighbouring vec4s of the tiles (owning 8 consecutive columns put lanes
+/// tn and tn + 4 on one bank: 4.5 → 5.6 TFLOPS on an RTX 3060 with the
+/// unchecked build).
+const F32T_NT_SRC: &str = r#"
+struct MmP { cols4: u32, rows: u32, nb: u32, kspan: u32 };
+@group(0) @binding(0) var<storage, read> wmm: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 16u;
+// k-major tiles: ta[k·16 + i] holds rows 4i … 4i+3 at k, tb the columns.
+var<workgroup> ta: array<vec4<f32>, 256>;
+var<workgroup> tb: array<vec4<f32>, 256>;
+
+// `kspan` > 0 splits K: workgroup z reduces columns [z·kspan, z·kspan + kspan)
+// into its own partial plane y[z][nb][rows] (summed by the caller); 0 is the
+// whole K into y.
+fn store4(zoff: u32, m: u32, n: u32, v: vec4<f32>) {
+    if (m >= pmm.nb) { return; }
+    let base = zoff + m * pmm.rows;
+    if (n < pmm.rows) { ymm[base + n] = v.x; }
+    if (n + 1u < pmm.rows) { ymm[base + n + 1u] = v.y; }
+    if (n + 2u < pmm.rows) { ymm[base + n + 2u] = v.z; }
+    if (n + 3u < pmm.rows) { ymm[base + n + 3u] = v.w; }
+}
+
+@compute @workgroup_size(64)
+fn gemm_nt_f32t(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32) {
+    let cols = pmm.cols4 * 4u;
+    let kbeg = wid.z * pmm.kspan;
+    let kend = select(cols, min(kbeg + pmm.kspan, cols), pmm.kspan != 0u);
+    let zoff = wid.z * pmm.nb * pmm.rows;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    // Thread (tm, tn) owns rows tm·8 … +7 and columns tn·8 … +7: sixteen
+    // named vec4 accumulators (a private array indexed at run time spills
+    // to memory under WGSL).
+    let tm = tid / 8u;
+    let tn = tid % 8u;
+    var c0a = vec4<f32>(); var c0b = vec4<f32>();
+    var c1a = vec4<f32>(); var c1b = vec4<f32>();
+    var c2a = vec4<f32>(); var c2b = vec4<f32>();
+    var c3a = vec4<f32>(); var c3b = vec4<f32>();
+    var c4a = vec4<f32>(); var c4b = vec4<f32>();
+    var c5a = vec4<f32>(); var c5b = vec4<f32>();
+    var c6a = vec4<f32>(); var c6b = vec4<f32>();
+    var c7a = vec4<f32>(); var c7b = vec4<f32>();
+    var k0 = kbeg;
+    loop {
+        if (k0 >= kend) { break; }
+        // One 4×4 block of x and of w per thread: four vec4 rows along k,
+        // transposed into k-major vec4s of four consecutive rows.
+        let bm = tid / 4u;
+        let bk = (tid % 4u) * 4u;
+        let kc = k0 + bk;
+        var x0 = vec4<f32>(); var x1 = vec4<f32>(); var x2 = vec4<f32>(); var x3 = vec4<f32>();
+        var w0 = vec4<f32>(); var w1 = vec4<f32>(); var w2 = vec4<f32>(); var w3 = vec4<f32>();
+        if (kc < kend) {
+            let r = m0 + bm * 4u;
+            if (r < pmm.nb) { x0 = xmm[(r * cols + kc) >> 2u]; }
+            if (r + 1u < pmm.nb) { x1 = xmm[((r + 1u) * cols + kc) >> 2u]; }
+            if (r + 2u < pmm.nb) { x2 = xmm[((r + 2u) * cols + kc) >> 2u]; }
+            if (r + 3u < pmm.nb) { x3 = xmm[((r + 3u) * cols + kc) >> 2u]; }
+            let q = n0 + bm * 4u;
+            if (q < pmm.rows) { w0 = wmm[(q * cols + kc) >> 2u]; }
+            if (q + 1u < pmm.rows) { w1 = wmm[((q + 1u) * cols + kc) >> 2u]; }
+            if (q + 2u < pmm.rows) { w2 = wmm[((q + 2u) * cols + kc) >> 2u]; }
+            if (q + 3u < pmm.rows) { w3 = wmm[((q + 3u) * cols + kc) >> 2u]; }
+        }
+        ta[bk * 16u + bm] = vec4<f32>(x0.x, x1.x, x2.x, x3.x);
+        ta[(bk + 1u) * 16u + bm] = vec4<f32>(x0.y, x1.y, x2.y, x3.y);
+        ta[(bk + 2u) * 16u + bm] = vec4<f32>(x0.z, x1.z, x2.z, x3.z);
+        ta[(bk + 3u) * 16u + bm] = vec4<f32>(x0.w, x1.w, x2.w, x3.w);
+        tb[bk * 16u + bm] = vec4<f32>(w0.x, w1.x, w2.x, w3.x);
+        tb[(bk + 1u) * 16u + bm] = vec4<f32>(w0.y, w1.y, w2.y, w3.y);
+        tb[(bk + 2u) * 16u + bm] = vec4<f32>(w0.z, w1.z, w2.z, w3.z);
+        tb[(bk + 3u) * 16u + bm] = vec4<f32>(w0.w, w1.w, w2.w, w3.w);
+        workgroupBarrier();
+        for (var kk = 0u; kk < KS; kk = kk + 1u) {
+            let a0 = ta[kk * 16u + tm];
+            let a1 = ta[kk * 16u + 8u + tm];
+            let b0 = tb[kk * 16u + tn];
+            let b1 = tb[kk * 16u + 8u + tn];
+            c0a = fma(vec4<f32>(a0.x), b0, c0a); c0b = fma(vec4<f32>(a0.x), b1, c0b);
+            c1a = fma(vec4<f32>(a0.y), b0, c1a); c1b = fma(vec4<f32>(a0.y), b1, c1b);
+            c2a = fma(vec4<f32>(a0.z), b0, c2a); c2b = fma(vec4<f32>(a0.z), b1, c2b);
+            c3a = fma(vec4<f32>(a0.w), b0, c3a); c3b = fma(vec4<f32>(a0.w), b1, c3b);
+            c4a = fma(vec4<f32>(a1.x), b0, c4a); c4b = fma(vec4<f32>(a1.x), b1, c4b);
+            c5a = fma(vec4<f32>(a1.y), b0, c5a); c5b = fma(vec4<f32>(a1.y), b1, c5b);
+            c6a = fma(vec4<f32>(a1.z), b0, c6a); c6b = fma(vec4<f32>(a1.z), b1, c6b);
+            c7a = fma(vec4<f32>(a1.w), b0, c7a); c7b = fma(vec4<f32>(a1.w), b1, c7b);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    // rows tm·4 … +3 (c0…c3) and 32 + tm·4 … (c4…c7); columns tn·4 … +3 (a)
+    // and 32 + tn·4 … (b): neighbouring threads read neighbouring vec4s of
+    // the tiles, no two lanes of a quarter-warp on one bank
+    let ma = m0 + tm * 4u;
+    let mc = m0 + 32u + tm * 4u;
+    let na = n0 + tn * 4u;
+    let nc = n0 + 32u + tn * 4u;
+    store4(zoff, ma + 0u, na, c0a); store4(zoff, ma + 0u, nc, c0b);
+    store4(zoff, ma + 1u, na, c1a); store4(zoff, ma + 1u, nc, c1b);
+    store4(zoff, ma + 2u, na, c2a); store4(zoff, ma + 2u, nc, c2b);
+    store4(zoff, ma + 3u, na, c3a); store4(zoff, ma + 3u, nc, c3b);
+    store4(zoff, mc + 0u, na, c4a); store4(zoff, mc + 0u, nc, c4b);
+    store4(zoff, mc + 1u, na, c5a); store4(zoff, mc + 1u, nc, c5b);
+    store4(zoff, mc + 2u, na, c6a); store4(zoff, mc + 2u, nc, c6b);
+    store4(zoff, mc + 3u, na, c7a); store4(zoff, mc + 3u, nc, c7b);
+}
+"#;
+
+/// `gemm_nn_coop` in plain f32: y[nb][rows] = x[nb][cols]·w[cols][rows], the
+/// same tile and thread layout as `F32T_NT_SRC`; x is read as vec4s along K
+/// (it is row-major like the forward's), w as one vec4 of four columns when
+/// rows % 4 == 0 (4.1 → 6.0 TFLOPS on an RTX 3060, scalar loads before).
+const F32T_NN_SRC: &str = r#"struct MmP { cols4: u32, rows: u32, nb: u32, kspan: u32 };
+@group(0) @binding(0) var<storage, read> wmm: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> xmm: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> ymm: array<f32>;
+@group(0) @binding(3) var<uniform> pmm: MmP;
+
+const KS: u32 = 16u;
+// k-major tiles: ta[k·16 + i] holds rows 4i … 4i+3 at k, tb the columns.
+var<workgroup> ta: array<vec4<f32>, 256>;
+var<workgroup> tb: array<vec4<f32>, 256>;
+
+fn store4(zoff: u32, m: u32, n: u32, v: vec4<f32>) {
+    if (m >= pmm.nb) { return; }
+    let base = zoff + m * pmm.rows;
+    if (n < pmm.rows) { ymm[base + n] = v.x; }
+    if (n + 1u < pmm.rows) { ymm[base + n + 1u] = v.y; }
+    if (n + 2u < pmm.rows) { ymm[base + n + 2u] = v.z; }
+    if (n + 3u < pmm.rows) { ymm[base + n + 3u] = v.w; }
+}
+
+// w [cols][rows] (k-major): the vec4 of columns n0 + (e%16)·4 … at k0 + e/16 —
+// one aligned load when rows % 4 == 0, four component picks otherwise
+fn wnn_at(k: u32, q: u32) -> f32 {
+    if (q >= pmm.rows) { return 0.0; }
+    let i = k * pmm.rows + q;
+    return wmm[i >> 2u][i & 3u];
+}
+
+var<private> n0g: u32;
+fn wnn(k0: u32, e: u32, kend: u32) -> vec4<f32> {
+    let k = k0 + e / 16u;
+    let q = n0g + (e % 16u) * 4u;
+    if (k >= kend) { return vec4<f32>(); }
+    if ((pmm.rows & 3u) == 0u) {
+        if (q >= pmm.rows) { return vec4<f32>(); }
+        return wmm[(k * pmm.rows + q) >> 2u];
+    }
+    return vec4<f32>(wnn_at(k, q), wnn_at(k, q + 1u), wnn_at(k, q + 2u), wnn_at(k, q + 3u));
+}
+
+@compute @workgroup_size(64)
+fn gemm_nn_f32t(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) tid: u32) {
+    n0g = wid.x * 64u;
+    let cols = pmm.cols4 * 4u;
+    let kbeg = wid.z * pmm.kspan;
+    let kend = select(cols, min(kbeg + pmm.kspan, cols), pmm.kspan != 0u);
+    let zoff = wid.z * pmm.nb * pmm.rows;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tm = tid / 8u;
+    let tn = tid % 8u;
+    // the thread's staging block: rows (or columns) bm·4 … +3 at k bk … +3
+    let bm = tid / 4u;
+    let bk = (tid % 4u) * 4u;
+    var c0a = vec4<f32>(); var c0b = vec4<f32>();
+    var c1a = vec4<f32>(); var c1b = vec4<f32>();
+    var c2a = vec4<f32>(); var c2b = vec4<f32>();
+    var c3a = vec4<f32>(); var c3b = vec4<f32>();
+    var c4a = vec4<f32>(); var c4b = vec4<f32>();
+    var c5a = vec4<f32>(); var c5b = vec4<f32>();
+    var c6a = vec4<f32>(); var c6b = vec4<f32>();
+    var c7a = vec4<f32>(); var c7b = vec4<f32>();
+    var x0 = vec4<f32>(); var x1 = vec4<f32>(); var x2 = vec4<f32>(); var x3 = vec4<f32>();
+    var w0 = vec4<f32>(); var w1 = vec4<f32>(); var w2 = vec4<f32>(); var w3 = vec4<f32>();
+    var k0 = kbeg;
+    loop {
+        if (k0 >= kend) { break; }
+    {
+            let kc = k0 + bk;
+            x0 = vec4<f32>(); x1 = vec4<f32>(); x2 = vec4<f32>(); x3 = vec4<f32>();
+            if (kc < kend) {
+                let r = m0 + bm * 4u;
+                if (r < pmm.nb) { x0 = xmm[(r * cols + kc) >> 2u]; }
+                if (r + 1u < pmm.nb) { x1 = xmm[((r + 1u) * cols + kc) >> 2u]; }
+                if (r + 2u < pmm.nb) { x2 = xmm[((r + 2u) * cols + kc) >> 2u]; }
+                if (r + 3u < pmm.nb) { x3 = xmm[((r + 3u) * cols + kc) >> 2u]; }
+            }
+        }
+        {
+            w0 = wnn(k0, tid, kend); w1 = wnn(k0, tid + 64u, kend);
+            w2 = wnn(k0, tid + 128u, kend); w3 = wnn(k0, tid + 192u, kend);
+        }
+        ta[bk * 16u + bm] = vec4<f32>(x0.x, x1.x, x2.x, x3.x);
+        ta[(bk + 1u) * 16u + bm] = vec4<f32>(x0.y, x1.y, x2.y, x3.y);
+        ta[(bk + 2u) * 16u + bm] = vec4<f32>(x0.z, x1.z, x2.z, x3.z);
+        ta[(bk + 3u) * 16u + bm] = vec4<f32>(x0.w, x1.w, x2.w, x3.w);
+        tb[tid] = w0; tb[tid + 64u] = w1; tb[tid + 128u] = w2; tb[tid + 192u] = w3;
+        workgroupBarrier();
+        for (var kk = 0u; kk < KS; kk = kk + 1u) {
+            let a0 = ta[kk * 16u + tm];
+            let a1 = ta[kk * 16u + 8u + tm];
+            let b0 = tb[kk * 16u + tn];
+            let b1 = tb[kk * 16u + 8u + tn];
+            c0a = fma(vec4<f32>(a0.x), b0, c0a); c0b = fma(vec4<f32>(a0.x), b1, c0b);
+            c1a = fma(vec4<f32>(a0.y), b0, c1a); c1b = fma(vec4<f32>(a0.y), b1, c1b);
+            c2a = fma(vec4<f32>(a0.z), b0, c2a); c2b = fma(vec4<f32>(a0.z), b1, c2b);
+            c3a = fma(vec4<f32>(a0.w), b0, c3a); c3b = fma(vec4<f32>(a0.w), b1, c3b);
+            c4a = fma(vec4<f32>(a1.x), b0, c4a); c4b = fma(vec4<f32>(a1.x), b1, c4b);
+            c5a = fma(vec4<f32>(a1.y), b0, c5a); c5b = fma(vec4<f32>(a1.y), b1, c5b);
+            c6a = fma(vec4<f32>(a1.z), b0, c6a); c6b = fma(vec4<f32>(a1.z), b1, c6b);
+            c7a = fma(vec4<f32>(a1.w), b0, c7a); c7b = fma(vec4<f32>(a1.w), b1, c7b);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    // rows tm·4 … +3 (c0…c3) and 32 + tm·4 … (c4…c7); columns tn·4 … +3 (a)
+    // and 32 + tn·4 … (b): neighbouring threads read neighbouring vec4s of
+    // the tiles, no two lanes of a quarter-warp on one bank
+    let ma = m0 + tm * 4u;
+    let mc = m0 + 32u + tm * 4u;
+    let na = n0 + tn * 4u;
+    let nc = n0 + 32u + tn * 4u;
+    store4(zoff, ma + 0u, na, c0a); store4(zoff, ma + 0u, nc, c0b);
+    store4(zoff, ma + 1u, na, c1a); store4(zoff, ma + 1u, nc, c1b);
+    store4(zoff, ma + 2u, na, c2a); store4(zoff, ma + 2u, nc, c2b);
+    store4(zoff, ma + 3u, na, c3a); store4(zoff, ma + 3u, nc, c3b);
+    store4(zoff, mc + 0u, na, c4a); store4(zoff, mc + 0u, nc, c4b);
+    store4(zoff, mc + 1u, na, c5a); store4(zoff, mc + 1u, nc, c5b);
+    store4(zoff, mc + 2u, na, c6a); store4(zoff, mc + 2u, nc, c6b);
+    store4(zoff, mc + 3u, na, c7a); store4(zoff, mc + 3u, nc, c7b);
+}
+"#;
+
 const COOP_NN_SRC: &str = r#"
 enable wgpu_cooperative_matrix;
 enable f16;
@@ -72318,6 +73085,27 @@ pub(crate) fn bake_f32_strict() -> bool {
     f32_strict()
 }
 
+/// The bake's forward GEMM pipeline: the f16-staged coop kernel, or — in
+/// the strict-f32 phase or without matrix units, on a discrete card — its
+/// plain-f32 twin (`F32T_NT_SRC`). None: the host (unified memory keeps its
+/// BLAS arm, faster than the shader cores there).
+fn bake_nt(c: &Ctx) -> Option<&wgpu::ComputePipeline> {
+    match c.gemm_nt_coop.as_ref() {
+        Some(p) if !f32_strict() => Some(p),
+        _ if c.discrete => Some(&c.gemm_nt_f32t),
+        _ => None,
+    }
+}
+
+/// `bake_nt` for the backward's NN product (`F32T_NN_SRC`).
+fn bake_nn(c: &Ctx) -> Option<&wgpu::ComputePipeline> {
+    match c.gemm_nn_coop.as_ref() {
+        Some(p) if !f32_strict() => Some(p),
+        _ if c.discrete => Some(&c.gemm_nn_f32t),
+        _ => None,
+    }
+}
+
 /// A bake weight on the card — but RESIDENT only once it has proven it
 /// recurs. Phase B hands this function a fresh activation matrix per dw
 /// step; a cache that adopts everything it sees grows by 250 MB a step
@@ -72775,10 +73563,15 @@ thread_local! {
 }
 
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    // The strict phase takes the plain-f32 tile kernel on a discrete card;
+    // unified memory keeps the host's arm there.
+    if f32_strict() && !c.discrete {
+        return false;
+    }
     let _op = c.op_gate.enter();
     // Small jobs lose to the round trip.
     if n * k * m < (1 << 22) {
@@ -72790,13 +73583,16 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
     // becomes an ordinary call. Held to discrete cards for the big-m case:
     // on unified memory the head weight's device copy would be 2 GB of the
     // laptop's RAM that the CPU path does not spend.
-    let coop = c
-        .gemm_nt_coop
-        .as_ref()
-        .filter(|_| !MIMO_F32_GEMM.get())
-        .filter(|_| !COOP_BYPASS.with(|b| b.get()))
-        .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
-        .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
+    let coop = if f32_strict() {
+        Some(&c.gemm_nt_f32t)
+    } else {
+        c.gemm_nt_coop
+            .as_ref()
+            .filter(|_| !MIMO_F32_GEMM.get())
+            .filter(|_| !COOP_BYPASS.with(|b| b.get()))
+    }
+    .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
+    .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
     // The scalar arm's dispatch is (m, n) workgroups — huge dims are
     // illegal, and a huge PRODUCT is a hang: a phase-B dw shape
     // (3072×21504 = 66M workgroups, four billion threads) ran minutes
@@ -72918,10 +73714,15 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
 /// calls it three times a layer and nothing else touches the card
 /// there, so this is what decides whether a bake is GPU work or not.
 pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m: usize) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    // The strict phase takes the plain-f32 tile kernel on a discrete card;
+    // unified memory keeps the host's arm there.
+    if f32_strict() && !c.discrete {
+        return false;
+    }
     let _op = c.op_gate.enter();
     if n * k * m < (1 << 22) || k > 65_000 || n > 65_000 {
         return false;
@@ -72989,9 +73790,7 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("bake-dx"),
         });
-    let coop = c
-        .gemm_nn_coop
-        .as_ref()
+    let coop = if f32_strict() { Some(&c.gemm_nn_f32t) } else { c.gemm_nn_coop.as_ref() }
         .filter(|_| m % 4 == 0 && k.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535);
     // The scalar dx arm has NO probe arbitrating it — the call site takes
     // whatever this function accepts, shadowing the Accelerate arm on
@@ -73049,7 +73848,17 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         pass.dispatch_workgroups(k as u32, n as u32, 1);
     }
     let bytes = (n * k * 4) as u64;
-    readback(c, enc, &dxb, &stage, bytes, &mut dx[..n * k])
+    // dX += dY·W, as `fcd_ops::gemm_dx` (and its CUDA twin) promise: a GDN
+    // layer's four projections and an FFN's gate and up accumulate into one
+    // dn. Reading the product straight into dx overwrote all but the last.
+    let mut prod = vec![0f32; n * k];
+    if !readback(c, enc, &dxb, &stage, bytes, &mut prod) {
+        return false;
+    }
+    for (d, p) in dx[..n * k].iter_mut().zip(&prod) {
+        *d += *p;
+    }
+    true
 }
 
 /// The bake's frozen FFN as ONE device chain: both = n2·guᵀ, act =
@@ -73097,10 +73906,10 @@ pub fn ffn_chain_f32(
         crate::fcd_ops::FfnAct::Silu => &c.bake_silu,
         crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu,
     };
-    let Some(nt) = c.gemm_nt_coop.as_ref() else {
+    let Some(nt) = bake_nt(c) else {
         return false;
     };
-    if f32_strict() || hsz % 4 != 0 || inter % 4 != 0 || n * hsz * 2 * inter < (1 << 22) {
+    if hsz % 4 != 0 || inter % 4 != 0 || n * hsz * 2 * inter < (1 << 22) {
         return false;
     }
     if (2 * inter).div_ceil(64) > 65_535 || n.div_ceil(64) > 65_535 || hsz.div_ceil(64) > 65_535 {
@@ -73384,12 +74193,12 @@ pub fn attn_chain_f32(
     attn_out: &mut [f32],
     want_acts: bool,
 ) -> Option<AttnChainActs> {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return None;
     }
     let c = ctx()?;
     let _op = c.op_gate.enter();
-    let nt = c.gemm_nt_coop.as_ref()?;
+    let nt = bake_nt(c)?;
     let (b, t, nh, nkv, hd, hsz) = (cfg.b, cfg.t, cfg.nh, cfg.nkv, cfg.hd, cfg.hsz);
     let n = b * t;
     let qdim = nh * hd;
@@ -73573,6 +74382,7 @@ pub fn attn_chain_f32(
                 usage: wgpu::BufferUsages::UNIFORM,
             })
     };
+    let ka = c.bake_attn(hd, cfg.rotary_half);
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -73624,7 +74434,7 @@ pub fn attn_chain_f32(
             });
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.bake_qkr.get_bind_group_layout(0),
+            layout: &ka.qkr.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, &plane),
                 bind_buf(1, &qnorm_buf),
@@ -73641,10 +74451,10 @@ pub fn attn_chain_f32(
             ],
         });
         let mut pass = begin_pass(&mut enc);
-        pass.set_pipeline(&c.bake_qkr);
+        pass.set_pipeline(ka.qkr);
         pass.set_bind_group(0, &bind, &[]);
-        let units = (n * (nh + 2 * nkv)) as u32;
-        pass.dispatch_workgroups(units.div_ceil(64), 1, 1);
+        let (gx, gy, gz) = ka.qkr_grid(n * (nh + 2 * nkv));
+        pass.dispatch_workgroups(gx, gy, gz);
     }
     {
         let u2 = c
@@ -73665,7 +74475,7 @@ pub fn attn_chain_f32(
             });
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.bake_attn_head.get_bind_group_layout(0),
+            layout: &ka.head.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, &qrot),
                 bind_buf(1, &krot),
@@ -73675,7 +74485,7 @@ pub fn attn_chain_f32(
             ],
         });
         let mut pass = begin_pass(&mut enc);
-        pass.set_pipeline(&c.bake_attn_head);
+        pass.set_pipeline(ka.head);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(t as u32, (b * nh) as u32, 1);
     }
@@ -73804,10 +74614,15 @@ pub fn attn_bwd_chain_f32(
     dk: &mut [f32],
     dv: &mut [f32],
 ) -> bool {
-    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    // Plain-f32 kernels: the strict phase runs them on a discrete card;
+    // unified memory keeps the host's arm there.
+    if f32_strict() && !c.discrete {
+        return false;
+    }
     let _op = c.op_gate.enter();
     let n = b * t;
     let qdim = nh * hd;
@@ -73877,6 +74692,7 @@ pub fn attn_bwd_chain_f32(
             contents: bytemuck::cast_slice(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
+    let ka = c.bake_attn(hd, 0);
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -73885,7 +74701,7 @@ pub fn attn_bwd_chain_f32(
     {
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.bake_attn_bwd_q.get_bind_group_layout(0),
+            layout: &ka.bwd_q.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, &qb),
                 bind_buf(1, &kb),
@@ -73897,14 +74713,14 @@ pub fn attn_bwd_chain_f32(
             ],
         });
         let mut pass = begin_pass(&mut enc);
-        pass.set_pipeline(&c.bake_attn_bwd_q);
+        pass.set_pipeline(ka.bwd_q);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(t as u32, (b * nh) as u32, 1);
     }
     {
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.bake_attn_bwd_kv.get_bind_group_layout(0),
+            layout: &ka.bwd_kv.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, &qb),
                 bind_buf(1, &kb),
@@ -73917,7 +74733,7 @@ pub fn attn_bwd_chain_f32(
             ],
         });
         let mut pass = begin_pass(&mut enc);
-        pass.set_pipeline(&c.bake_attn_bwd_kv);
+        pass.set_pipeline(ka.bwd_kv);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(t as u32, (b * nkv) as u32, 1);
     }
@@ -73978,11 +74794,10 @@ pub fn ffn_bwd_chain_f32(
         crate::fcd_ops::FfnAct::Silu => &c.bake_silu_bwd,
         crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu_bwd,
     };
-    let Some(nn) = c.gemm_nn_coop.as_ref() else {
+    let Some(nn) = bake_nn(c) else {
         return false;
     };
-    if f32_strict()
-        || !c.discrete
+    if !c.discrete
         || hsz % 4 != 0
         || inter % 2 != 0
         || n * hsz * 2 * inter < (1 << 22)

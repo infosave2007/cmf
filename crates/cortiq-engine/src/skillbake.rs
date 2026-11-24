@@ -532,6 +532,18 @@ fn is_scored_target(
             || (target_index + 1 < sequence_end && follow.contains(&ids[target_index + 1])))
 }
 
+#[cfg(feature = "gpu")]
+thread_local! {
+    /// Set while the resident check runs the layer path on the same batch.
+    static RES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "gpu")]
+fn res_check() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("CMF_BAKE_RES_CHECK").as_deref() == Ok("1"))
+}
+
 /// The scored target indices (into the flat batch) of the sequence at
 /// `base..base + t`: its answer span, its focused labels, or every
 /// position.
@@ -775,10 +787,11 @@ impl Pass<'_> {
     }
 
     /// The whole pass (forward, loss, Phase-A backward) as one resident step
-    /// on CUDA (`FcdModel::resident_step`): language-model or answer-span
-    /// loss, frozen attention, no trained copies, a single loop. None: the
+    /// on CUDA (`FcdModel::resident_step`) or a discrete wgpu card
+    /// (`FcdModel::resident_step_wgpu`): language-model or answer-span loss,
+    /// frozen attention, no trained copies, a single loop. None: the
     /// layer-by-layer path below runs.
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "gpu")]
     #[allow(clippy::type_complexity)]
     fn resident(
         &self,
@@ -792,10 +805,10 @@ impl Pass<'_> {
         focus_stats: &mut Option<&mut FocusStats>,
     ) -> Option<(f64, usize)> {
         let fm = self.fm;
-        if !crate::gpu::cuda_active() || !self.focus_tokens.is_empty() || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
+        if !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) || !self.focus_tokens.is_empty() || fm.loops > 1 || b == 0 || ids.len() % b != 0 {
             return None;
         }
-        if self.through_attn || self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
+        if self.attn_tr.iter().any(|a| a.is_some()) || self.ffn.iter().any(|f| f.is_some()) {
             return None;
         }
         let t = ids.len() / b;
@@ -810,14 +823,25 @@ impl Pass<'_> {
         let ffn: Vec<(LnFfn, Vec<f32>)> = (0..nl).map(|li| (self.wts(li, &mats[li]), self.gates(li))).collect();
         let scored = targets.len();
         let inv_n = 1.0 / scored as f64;
-        let out = fm.resident_step(ids, b, &ffn, &mats, &targets, inv_n as f32, grad.is_some())?;
+        let (want, ta) = (grad.is_some(), self.through_attn);
+        // the label is only broken out of in a CUDA build
+        #[allow(unused_labels)]
+        let (out_nll, out_argmax, out_dmask) = 'step: {
+            #[cfg(feature = "cuda")]
+            if crate::gpu::cuda_active() {
+                let o = fm.resident_step(ids, b, &ffn, &mats, &targets, inv_n as f32, want, ta)?;
+                break 'step (o.nll, o.argmax, o.dmask);
+            }
+            let o = fm.resident_step_wgpu(ids, b, &ffn, &mats, &targets, inv_n as f32, want, ta)?;
+            (o.nll, o.argmax, o.dmask)
+        };
         let mut nll = 0f64;
         let span_stats = self.span.is_some();
         let want_hits = focus_stats.is_some() && self.span.is_some_and(|sp| sp.values.is_some());
         let mut hits = Vec::with_capacity(if want_hits { scored } else { 0 });
         for (r, &ti) in targets.iter().enumerate() {
-            nll += out.nll[r] as f64;
-            let ok = out.argmax[r] == ids[ti];
+            nll += out_nll[r] as f64;
+            let ok = out_argmax[r] == ids[ti];
             if span_stats {
                 if let Some(stats) = focus_stats.as_deref_mut() {
                     stats.total += 1;
@@ -833,11 +857,11 @@ impl Pass<'_> {
         if want_hits {
             let qdebug: usize = std::env::var("CMF_BAKE_QDEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             if let Some(stats) = focus_stats.as_deref_mut() {
-                self.whole_verdicts(ids, b, t, &targets, &hits, &out.argmax, stats, qdebug);
+                self.whole_verdicts(ids, b, t, &targets, &hits, &out_argmax, stats, qdebug);
             }
         }
         if let Some((dmask, _, _)) = grad.as_mut() {
-            for (li, dm) in out.dmask.iter().enumerate() {
+            for (li, dm) in out_dmask.iter().enumerate() {
                 for (d, &x) in dmask[li].iter_mut().zip(dm) {
                     *d += x as f64;
                 }
@@ -1015,13 +1039,49 @@ impl Pass<'_> {
         )>,
         mut focus_stats: Option<&mut FocusStats>,
     ) -> (f64, usize) {
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let mut grad = grad;
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "gpu")]
         let mut focus_stats = focus_stats;
-        #[cfg(feature = "cuda")]
-        if let Some(r) = self.resident(ids, b, &mut grad, &mut focus_stats) {
-            return r;
+        #[cfg(feature = "gpu")]
+        if !RES_OFF.get() {
+            // CMF_BAKE_RES_CHECK=1: each resident step is checked against the
+            // layer path on the same batch (the mask gradient per layer, the
+            // loss); the layer path's result is the one kept.
+            let check = res_check() && grad.is_some();
+            let snap: Option<Vec<Vec<f64>>> = if check { grad.as_ref().map(|g| g.0.to_vec()) } else { None };
+            if let Some(r) = self.resident(ids, b, &mut grad, &mut focus_stats) {
+                let Some(snap) = snap else { return r };
+                let g = grad.as_mut().expect("checked above");
+                let d_res: Vec<Vec<f64>> = g.0.iter().zip(&snap).map(|(a, s)| a.iter().zip(s).map(|(x, y)| x - y).collect()).collect();
+                for (a, s) in g.0.iter_mut().zip(&snap) {
+                    a.copy_from_slice(s);
+                }
+                RES_OFF.set(true);
+                let lay = self.chunk_batch_scored(ids, b, grad.as_mut().map(|(a, b2, c)| (&mut **a, &mut **b2, &mut **c)), focus_stats.as_deref_mut());
+                RES_OFF.set(false);
+                let g = grad.as_ref().expect("checked above");
+                let (mut worst, mut at) = (0f64, 0usize);
+                for (li, ((a, s), dr)) in g.0.iter().zip(&snap).zip(&d_res).enumerate() {
+                    let (mut num, mut den) = (0f64, 0f64);
+                    for ((x, y), r) in a.iter().zip(s).zip(dr) {
+                        let dl = x - y;
+                        num += (r - dl) * (r - dl);
+                        den += dl * dl;
+                    }
+                    let rel = (num / den.max(1e-300)).sqrt();
+                    if rel > worst {
+                        (worst, at) = (rel, li);
+                    }
+                }
+                eprintln!(
+                    "[bake-res-check] nll resident {:.6} layer path {:.6} | mask gradient rel. diff max {:.3e} (layer {at})",
+                    r.0 / r.1.max(1) as f64,
+                    lay.0 / lay.1.max(1) as f64,
+                    worst
+                );
+                return lay;
+            }
         }
         let fm = self.fm;
         let hsz = fm.hidden;
@@ -2619,7 +2679,7 @@ pub fn skill_bake(
                 best_step = step + 1;
             }
             log(&format!(
-                "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3}{} (bottom {}@{:.2}%) [fwd+bwd {:.1}s, adam {:.2}s per step]",
+                "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3}{} (bottom {}@{:.2}%) [fwd+bwd {:.2}s, adam {:.2}s per step]",
                 step + 1,
                 sp * 100.0,
                 score_suffix(&hs),

@@ -2154,4 +2154,119 @@ mod gpu_bake_tests {
         let rel = (num / den).sqrt();
         assert!(rel < 1e-4, "gemm_dx GPU vs CPU rel {rel:e}");
     }
+
+    fn rel(want: &[f32], got: &[f32]) -> f64 {
+        let num: f64 = want.iter().zip(got).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+        let den: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().max(1e-30);
+        (num / den).sqrt()
+    }
+
+    /// Deterministic values in [-0.5, 0.5) (splitmix-style: no short period,
+    /// so a long dot product does not cancel into its rounding).
+    fn synth(n: usize, salt: u64) -> Vec<f32> {
+        (0..n as u64)
+            .map(|i| {
+                let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
+                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((x >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32
+            })
+            .collect()
+    }
+
+    /// The device attention-core backward against the host's, at the shapes
+    /// of a Qwen3.5 full-attention layer (hd 256, GQA 8 : 2) and of Qwen3's
+    /// (hd 128, 16 : 8), strict f32 and the coop phase alike.
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn attn_bwd_chain_matches_cpu() {
+        if std::env::var("CMF_GPU").is_err() {
+            eprintln!("no backend requested — skip");
+            return;
+        }
+        for (b, t, nh, nkv, hd) in [(2usize, 40usize, 8usize, 2usize, 256usize), (2, 40, 16, 8, 128)] {
+            let (qdim, kvdim) = (nh * hd, nkv * hd);
+            let n = b * t;
+            let (q, k, v, dao) = (synth(n * qdim, 1), synth(n * kvdim, 2), synth(n * kvdim, 3), synth(n * qdim, 4));
+            let (mut wq, mut wk, mut wv) = (vec![0f32; n * qdim], vec![0f32; n * kvdim], vec![0f32; n * kvdim]);
+            let rep = nh / nkv;
+            for bi in 0..b {
+                for h in 0..nh {
+                    let g = h / rep;
+                    let col = |src: &[f32], dim: usize, head: usize| -> Vec<f64> {
+                        (0..t).flat_map(|p| (0..hd).map(move |c| (bi * t + p, c)))
+                            .map(|(r, c)| src[r * dim + head * hd + c] as f64 * 0.25).collect()
+                    };
+                    let (q64, k64, v64, d64) = (col(&q, qdim, h), col(&k, kvdim, g), col(&v, kvdim, g), col(&dao, qdim, h));
+                    let (mut dq, mut dk, mut dv) = (vec![0f64; t * hd], vec![0f64; t * hd], vec![0f64; t * hd]);
+                    super::attn_head_bwd_window(&q64, &k64, &v64, &d64, t, hd, hd, None, &mut dq, &mut dk, &mut dv);
+                    for p in 0..t {
+                        let r = bi * t + p;
+                        for c in 0..hd {
+                            wq[r * qdim + h * hd + c] += dq[p * hd + c] as f32;
+                            wk[r * kvdim + g * hd + c] += dk[p * hd + c] as f32;
+                            wv[r * kvdim + g * hd + c] += dv[p * hd + c] as f32;
+                        }
+                    }
+                }
+            }
+            let sc = |x: &[f32]| x.iter().map(|v| v * 0.25).collect::<Vec<f32>>();
+            let (q, k, v, dao) = (sc(&q), sc(&k), sc(&v), sc(&dao));
+            for strict in [true, false] {
+                crate::gpu::bake_precision_strict(strict);
+                let (mut gq, mut gk, mut gv) = (vec![0f32; n * qdim], vec![0f32; n * kvdim], vec![0f32; n * kvdim]);
+                let ok = crate::gpu_wgpu::attn_bwd_chain_f32(&q, &k, &v, &dao, b, t, nh, nkv, hd, None, &mut gq, &mut gk, &mut gv);
+                crate::gpu::bake_precision_strict(false);
+                if !ok {
+                    eprintln!("hd {hd}, strict {strict}: device declined — skip");
+                    continue;
+                }
+                let (eq, ek, ev) = (rel(&wq, &gq), rel(&wk, &gk), rel(&wv, &gv));
+                eprintln!("hd {hd} nh {nh}:{nkv} strict {strict}: dq {eq:.2e} dk {ek:.2e} dv {ev:.2e}");
+                assert!(eq < 1e-4 && ek < 1e-4 && ev < 1e-4, "attn backward hd {hd}: dq {eq:e} dk {ek:e} dv {ev:e}");
+            }
+        }
+    }
+
+    /// `gemm_dx_f32` at the GDN projections' shapes (qkv 6144, z 2048, a/b 16
+    /// rows of a 1024-wide layer) and an attention one, strict and coop.
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn gemm_dx_gdn_shapes_match_cpu() {
+        if std::env::var("CMF_GPU").is_err() {
+            eprintln!("no backend requested — skip");
+            return;
+        }
+        for (n, k, m) in [(256usize, 1024usize, 6144usize), (256, 1024, 2048), (256, 1024, 16), (256, 1024, 4096), (256, 2048, 1024)] {
+            let (dy, w) = (synth(n * m, 5), synth(m * k, 6));
+            // dX += dY·W: start from a filled dx, as a GDN layer's four
+            // projections accumulating into one dn do.
+            let start = synth(n * k, 7);
+            // The reference in f64 on the host: `super::gemm_dx` would take
+            // the device arm itself.
+            let mut want = start.clone();
+            for i in 0..n {
+                for j in 0..k {
+                    let mut acc = 0f64;
+                    for o in 0..m {
+                        acc += dy[i * m + o] as f64 * w[o * k + j] as f64;
+                    }
+                    want[i * k + j] += acc as f32;
+                }
+            }
+            for strict in [true, false] {
+                crate::gpu::bake_precision_strict(strict);
+                let mut got = start.clone();
+                let ok = crate::gpu_wgpu::gemm_dx_f32(&dy, &w, &mut got, n, k, m);
+                crate::gpu::bake_precision_strict(false);
+                if !ok {
+                    eprintln!("{n}x{k}x{m} strict {strict}: declined");
+                    continue;
+                }
+                let e = rel(&want, &got);
+                eprintln!("{n}x{k}x{m} strict {strict}: rel {e:.2e}");
+                assert!(e < if strict { 1e-5 } else { 2e-3 }, "gemm_dx {n}x{k}x{m} strict {strict}: rel {e:e}");
+            }
+        }
+    }
 }
