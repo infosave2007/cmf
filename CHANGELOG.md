@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.19] — 2026-11-24
+
 ### Added
 - `skill bake --mask-scope linear`: the DTG-MA mask on the output rows of every projection — the GDN
   in-projections and out_proj, q/k/v/o, gate, up and down — as the DTG-MA notebooks' DTGMALinear places it,
