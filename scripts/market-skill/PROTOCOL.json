@@ -1,0 +1,20 @@
+{
+  "frozen_utc": "2026-11-24T10:00:00Z",
+  "why": "The article draft (docs/HABR_QWEN_BTC_SKILL.ru.md, 47.75% -> 47.25%) was measured with the defective bake: the mask gradient skipped frozen attention and a hard tau=0.5 cut the mask. This repeats the experiment with the fixed engine (--through-attn, soft mask).",
+  "markets": {"BTCUSDT": "Binance 1h klines", "EURUSD": "Yahoo EURUSD=X 1h", "USDJPY": "Yahoo USDJPY=X 1h"},
+  "period": "2024-02-07 00:00 UTC .. 2026-11-24 00:00 UTC (exclusive)",
+  "window_closed_candles": 48,
+  "targets": {
+    "dir": "UP if close[t+1] > close[t], else DOWN (the article target)",
+    "range": "HIGH if the next candle high-low range (bps) > the median next-candle range of the same market over its own train split, else LOW"
+  },
+  "split": "per market chronological 70/15/15 over valid anchors, purge 49 h at both boundaries; the next bar must be exactly +1 h",
+  "base_model": "Qwen3.5-0.8B q8_2f (cmf/qwen35-0.8b-q8_2f.cmf)",
+  "skill": "one skill per target, trained on all three markets (balanced 4000 records per market, interleaved)",
+  "bake": "cortiq skill bake --focus-tokens <classes> --record-start <|im_start|>system --length-buckets --drop-oversize --chunk 512 --checkpoint-accuracy --held-files held_corpus.txt (160 balanced validation records per market) --held-tags held_tags.jsonl --steps-a 750 --batch 8 --eval-every 50 --steps-b 0 --mask-init 2.0 --lr-a 0.1 --l1-init 0.56 --l1-step 0 --tau 0.001 --through-attn --soft-fold --no-defrag; CMF_GPU=cuda",
+  "checkpoint_selection": "inside the bake, by held (validation) accuracy only",
+  "eval": "cortiq serve with class_tokens, greedy, thinking off; validation 400 evenly spaced records per market, test 1000 per market, natural class mix",
+  "metrics": ["accuracy", "balanced accuracy", "macro-F1", "skill-base accuracy delta with paired block-bootstrap 95% CI (blocks of 20)", "skill accuracy on its 20% most confident predictions"],
+  "baselines": ["majority class of train", "dir: momentum and reversal of r1", "range: persistence of the current range, hour-of-day prior", "logistic regression on the prompt features + hour"],
+  "test_policy": "test predictions are generated once, after both skills are frozen; every market x target result is reported, none is dropped"
+}
