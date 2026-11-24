@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.18] — 2026-11-24
+
 ### Added
 - `skill bake --through-attn`: Phase A's mask gradient also runs through every frozen attention (and GDN)
   branch — o_proj, the output gate, the attention core, RoPE, the q/k norms and the projections, input
@@ -85,6 +87,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5.3 → 1.7 s on Qwen3.5-0.8B, the same held-out PPL as CPU and CUDA.
 
 ### Fixed
+- wgpu, looped mHC stacks (SenseNova-Loop): on a card whose weight budget holds only part of the stack, the
+  token and batch graphs run a device prefix and the host the rest; a cut inside an mHC range left the host's
+  layers on stale streams while the live ones sat on the card — garbage after the first token, with drafts and
+  without (reported on Windows). The host's layers now start from the card's streams, read back at the cut
+  (the token's, or a prompt chunk's rows), and the prefix stays where the budget puts it. Apple M4 over wgpu,
+  SenseNova-Loop-9B q4tp under a 4.2 / 5 GB budget (prefix 38 / 46 of 56 layers): the whole graph's answer.
 - `skill bake --through-attn` on Vulkan: the wgpu `gemm_dx` wrote its product over dX where the contract (and the
   CPU and CUDA twins) is dX += dY·W, so a GDN layer's four projections kept only the last one's gradient
   (Qwen3.5-0.8B: held-out PPL 2.764 after 4 steps against 2.441 on CPU and CUDA).

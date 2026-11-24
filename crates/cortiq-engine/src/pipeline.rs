@@ -152,6 +152,10 @@ pub struct Pipeline {
     dash_batch_on: bool,
     /// The decode token's mHC streams, `[streams · hidden]`.
     mhc_r: Vec<f32>,
+    /// A prompt chunk's rows' mHC streams a device prefix left on the card
+    /// (`[rows][streams · hidden]`), for the host's batched walk that continues
+    /// inside the range (`mhc_from_device`); taken by that walk.
+    mhc_rows_in: Vec<f32>,
     /// Interleaved-MRoPE sections and the prompt rows' (t, h, w) positions
     /// for the prefill of an image prompt (SenseNova-Loop); cleared when
     /// the prefill ends.
@@ -3010,6 +3014,25 @@ impl Pipeline {
         self.mhc.as_ref().is_some_and(|m| m.on(self.phys_layer(li)))
     }
 
+    /// A device prefix stopped at layer `at`, inside an mHC range (not its first
+    /// layer): the host's layers continue from the streams the card holds — the
+    /// decode token's (`mhc_r`) or, `chunk` rows given, a prompt chunk's for
+    /// `prefill_batch_span`. False when `at` is not inside a range.
+    fn mhc_from_device(&mut self, at: usize, chunk: Option<usize>) -> bool {
+        let inside = at < self.num_layers
+            && self.mhc_layer(at)
+            && !self.mhc.as_deref().is_some_and(|m| m.enters(self.phys_layer(at)));
+        if !inside {
+            return false;
+        }
+        match (crate::gpu::mhc_streams_read(self.hidden_size, chunk.unwrap_or(1)), chunk) {
+            (Some(r), None) => self.mhc_r = r,
+            (Some(r), Some(_)) => self.mhc_rows_in = r,
+            (None, _) => tracing::error!("mHC: the device prefix's streams could not be read back at layer {at}"),
+        }
+        true
+    }
+
     /// mHC before a sub-layer of the decode token: route its streams into
     /// `h` (entering the range copies `h` into every stream first).
     fn mhc_pre(&mut self, li: usize, ffn: bool, h: &mut [f32]) -> crate::sensenova::MhcCoef {
@@ -4869,6 +4892,7 @@ impl Pipeline {
             dash_batch_on: true,
             mhc: None,
             mhc_r: Vec::new(),
+            mhc_rows_in: Vec::new(),
             mrope_sections: None,
             prompt_mrope: None,
             vocab_size,
@@ -7915,6 +7939,7 @@ impl Pipeline {
                 match outcome {
                     crate::gpu::BatchGraphOutcome::Completed => {
                         let hb = if run < self.num_layers {
+                            self.mhc_from_device(run, Some(bk));
                             self.prefill_batch_span(
                                 PrefillIn::Hidden(&hiddens),
                                 pos,
@@ -15345,6 +15370,7 @@ impl Pipeline {
             ) {
                 crate::gpu::BatchGraphOutcome::Completed => {
                     let out = if run < self.num_layers {
+                        self.mhc_from_device(run, Some(bk));
                         self.prefill_batch_span(
                             PrefillIn::Hidden(&hiddens),
                             pos,
@@ -15519,8 +15545,9 @@ impl Pipeline {
 
         #[cfg(target_os = "macos")]
         let mut chunk_skip_until = 0usize;
-        // SenseNova-Loop: the chunk rows' mHC streams.
-        let mut mhc_rs: Vec<f32> = Vec::new();
+        // SenseNova-Loop: the chunk rows' mHC streams (a device prefix that
+        // stopped inside the range left them here).
+        let mut mhc_rs: Vec<f32> = std::mem::take(&mut self.mhc_rows_in);
         for li in from..upto_excl {
             let _capacity_tail = automatic_gpu_prefix
                 .filter(|&prefix| {
@@ -23156,6 +23183,7 @@ impl Pipeline {
                     // boundary crossing per token.
                     h = hh;
                     tail_start = gl;
+                    self.mhc_from_device(gl, None);
                     self.absorb_phi_tap(0..gl);
                 } else if graph_trusted || !crate::gpu::graph_race_first_token_hopeless(dur) {
                     if !graph_trusted {
@@ -23255,6 +23283,7 @@ impl Pipeline {
                 // Partial device prefix of the span: CPU owns the tail.
                 h = hh;
                 tail_start = from + gl;
+                self.mhc_from_device(tail_start, None);
             }
         }
         // Layers the host is about to run whose device mirror moved ahead

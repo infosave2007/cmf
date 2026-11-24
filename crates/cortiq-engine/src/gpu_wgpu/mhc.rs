@@ -631,6 +631,30 @@ fn bind(c: &Ctx, pipe: &wgpu::ComputePipeline, bufs: &[&wgpu::Buffer]) -> wgpu::
 
 static BUFS: std::sync::Mutex<Option<(usize, wgpu::Buffer, wgpu::Buffer)>> = std::sync::Mutex::new(None);
 
+/// The streams of the first `rows` rows as the last graph left them (`[rows][2][d]`),
+/// read off the card. None when no graph has made them.
+pub(crate) fn read_streams(c: &Ctx, d: usize, rows: usize) -> Option<Vec<f32>> {
+    let r = {
+        let g = BUFS.lock().unwrap();
+        let (cap, r, _) = g.as_ref()?;
+        if *cap < rows || r.size() < (rows * 2 * d * 4) as u64 {
+            return None;
+        }
+        r.clone()
+    };
+    let n = rows * 2 * d;
+    let size = (n * 4) as u64;
+    let staging = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mhc-streams-read"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mhc-streams-read") });
+    let mut out = vec![0f32; n];
+    super::readback(c, enc, &r, &staging, size, &mut out).then_some(out)
+}
+
 /// The streams buffer (`[2·d]` f32) and the coefficient buffer, kept.
 pub(crate) fn bufs(c: &Ctx, d: usize) -> (wgpu::Buffer, wgpu::Buffer) {
     bufs_k(c, d, 1)
