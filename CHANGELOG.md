@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.18] — 2026-11-24
+
 ### Added
 - `skill bake --through-attn`: Phase A's mask gradient also runs through every frozen attention (and GDN)
   branch — o_proj, the output gate, the attention core, RoPE, the q/k norms and the projections, input
