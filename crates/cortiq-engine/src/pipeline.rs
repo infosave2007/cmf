@@ -28939,8 +28939,8 @@ mod tests {
         let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Exercise the experimental host pair deterministically; the native
         // and wgpu batch graphs have independent coverage.
+        let _gpu_env = crate::gpu::test_gpu_env("0");
         let _env = ScopedTestEnv::set(&[
-            ("CMF_GPU", Some("0")),
             ("CMF_GPU_WGPU_GRAPH", Some("0")),
             ("CMF_MTP_PAIR", Some("1")),
         ]);
@@ -28966,8 +28966,8 @@ mod tests {
     #[test]
     fn speculative_accepts_constant_oracle() {
         let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu_env = crate::gpu::test_gpu_env("0");
         let _env = ScopedTestEnv::set(&[
-            ("CMF_GPU", Some("0")),
             ("CMF_GPU_WGPU_GRAPH", Some("0")),
             ("CMF_MTP_PAIR", Some("1")),
         ]);
@@ -28993,8 +28993,8 @@ mod tests {
     #[test]
     fn host_fused_mtp_pair_is_opt_in() {
         let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu_env = crate::gpu::test_gpu_env("0");
         let _env = ScopedTestEnv::set(&[
-            ("CMF_GPU", Some("0")),
             ("CMF_GPU_WGPU_GRAPH", Some("0")),
             ("CMF_MTP_PAIR", None),
         ]);
@@ -29874,8 +29874,8 @@ mod tests {
     #[test]
     fn mimo_speculative_greedy_equals_plain_greedy() {
         let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _gpu_env = crate::gpu::test_gpu_env("0");
         let _env = ScopedTestEnv::set(&[
-            ("CMF_GPU", Some("0")),
             ("CMF_GPU_WGPU_GRAPH", Some("0")),
         ]);
         let ids: Vec<u32> = (0..9u32).map(|i| (i * 7 + 3) % 64).collect();

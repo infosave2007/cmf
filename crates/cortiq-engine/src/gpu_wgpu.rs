@@ -58910,7 +58910,7 @@ mod tests {
     /// context acquired by the surrounding test (or by a parallel test).
     #[test]
     fn gpu_test_drain_keeps_shared_context_live() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping shared-context teardown test");
             return;
@@ -58943,7 +58943,7 @@ mod tests {
     /// the card, with M not a multiple of the 128-row tile.
     #[test]
     fn zi_route_matches_int8_coop_gemm_bit_for_bit() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping zi route test");
             return;
@@ -59016,7 +59016,7 @@ mod tests {
     /// matrix-unit arm stays within f16-operand error of the same result.
     #[test]
     fn chunk_attend_mirror_matches_host_upload() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping mirror attend test");
             return;
@@ -59091,7 +59091,7 @@ mod tests {
     /// of that key would have overflowed to inf.
     #[test]
     fn chunk_attend_mirror_f16_guard_takes_f32_kernels() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping f16 guard test");
             return;
@@ -59162,7 +59162,7 @@ mod tests {
     /// layer's ring, and the next chunk continues from the reseeded rows.
     #[test]
     fn chunk_attend_mirror_reseeds_when_ahead_of_the_host() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping mirror reseed test");
             return;
@@ -59241,7 +59241,7 @@ mod tests {
     /// (reseeded from the tail).
     #[test]
     fn chunk_attend_mirror_reads_a_trimmed_host_tail() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping trimmed-tail mirror test");
             return;
@@ -59404,7 +59404,7 @@ mod tests {
 
     #[test]
     fn qwen_f32_const_keeps_recorded_bias_snapshot() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping qwen constant lifetime test");
             return;
@@ -59456,7 +59456,7 @@ mod tests {
 
     #[test]
     fn qwen_layernorm_mod_matches_cpu_across_warps() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping qwen layernorm parity test");
             return;
@@ -59552,7 +59552,7 @@ mod tests {
 
     #[test]
     fn dit_coop_matmul_preserves_odd_reduction_tail() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping DiT cooperative odd-tail test");
             return;
@@ -59661,7 +59661,7 @@ mod tests {
     #[test]
     fn wgpu_q8_matvec_matches_cpu_reference() {
         // Force the wgpu path on (Metal-via-wgpu locally; Vulkan on the server).
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping parity test");
             return;
@@ -59726,7 +59726,7 @@ mod tests {
     fn wgpu_q8_2f_odd_rows_matches_cpu_reference() {
         use wgpu::util::DeviceExt;
 
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q8_2f parity test");
             return;
@@ -59852,7 +59852,7 @@ mod tests {
             eprintln!("CMF_Q8_2F_MODEL is not set — skipping");
             return;
         };
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q8_2f model parity test");
             return;
@@ -59964,7 +59964,7 @@ mod tests {
     #[ignore]
     fn wgpu_chain_probe() {
         use std::time::Instant;
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -60094,7 +60094,7 @@ mod tests {
 
     #[test]
     fn wgpu_q1_matvec_matches_cpu_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q1 parity test");
             return;
@@ -60131,7 +60131,7 @@ mod tests {
 
     #[test]
     fn wgpu_rmsnorm_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         if ctx().is_none() {
             eprintln!("no wgpu adapter — skipping rmsnorm parity test");
             return;
@@ -60170,7 +60170,7 @@ mod tests {
 
     #[test]
     fn wgpu_add_rmsnorm_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -60246,7 +60246,7 @@ mod tests {
 
     #[test]
     fn wgpu_attn_rope_qkn_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         if ctx().is_none() {
             eprintln!("no wgpu adapter — skipping attn_rope parity test");
             return;
@@ -60330,7 +60330,7 @@ mod tests {
 
     #[test]
     fn wgpu_gqa_attend_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping gqa_attend parity test");
             return;
@@ -60406,7 +60406,7 @@ mod tests {
     /// last one — the regime the per-head kernel streamed six times over.
     #[test]
     fn wgpu_gqa_attend_gpart_matches_split_and_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -60510,7 +60510,7 @@ mod tests {
         // group, clone it, advance the clone one token on the CPU, and
         // require the device mirror (upload + o1_far/o1_push/o1_attend)
         // to produce the same attention output from the same state.
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping o1 test");
             return;
@@ -60835,9 +60835,7 @@ mod tests {
         // 256..1523 are each inserted once as a real post-seal step.
         let path = std::env::var("CMF_O1_REPLAY_TAPE")
             .expect("CMF_O1_REPLAY_TAPE is required for corrected replay");
-        unsafe {
-            std::env::set_var("CMF_GPU", "wgpu");
-        }
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         assert_eq!(
             std::env::var("WGPU_BACKEND").as_deref(),
             Ok("vulkan"),
@@ -61345,7 +61343,7 @@ mod tests {
 
     #[test]
     fn wgpu_gdn_step_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         if ctx().is_none() {
             eprintln!("no wgpu adapter — skipping gdn_step test");
             return;
@@ -61425,7 +61423,7 @@ mod tests {
 
     #[test]
     fn wgpu_gdn_conv_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         if ctx().is_none() {
             eprintln!("no wgpu adapter — skipping gdn_conv test");
             return;
@@ -61487,7 +61485,7 @@ mod tests {
 
     #[test]
     fn wgpu_attn_block_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping attn_block test");
             return;
@@ -61705,7 +61703,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wgpu_coop_small_gemm() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         unsafe { std::env::set_var("CMF_COOP", "1") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu device — skipping");
@@ -61819,7 +61817,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wgpu_coop_layout_probe() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         unsafe { std::env::set_var("CMF_COOP", "1") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu device — skipping");
@@ -62065,7 +62063,7 @@ fn main(@builtin(local_invocation_index) tid: u32,
     #[test]
     #[ignore]
     fn wgpu_coop_f16_16x16_probe() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         unsafe { std::env::set_var("CMF_COOP", "1") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu device — skipping");
@@ -62138,7 +62136,7 @@ fn main() {
     #[test]
     #[ignore]
     fn wgpu_matrix_features() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let inst = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             flags: wgpu::InstanceFlags::default(),
@@ -62173,7 +62171,7 @@ fn main() {
     #[ignore]
     fn wgpu_q4tp_mm_throughput() {
         use std::time::Instant;
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -62263,7 +62261,7 @@ fn main() {
     }
 
     fn x2_matches_two_singles(cols: usize) {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -62374,7 +62372,7 @@ fn main() {
     /// including rung 0 = exact zero).
     #[test]
     fn wgpu_q2tp_matvec16w_matches_cpu_dequant() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -62531,8 +62529,8 @@ fn main() {
     /// explicitly measured approximation in this experiment.
     #[test]
     fn wgpu_q2tp_affine_dp4a_matches_independent_q8_oracle() {
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         unsafe {
-            std::env::set_var("CMF_GPU", "wgpu");
             std::env::set_var("CMF_Q2_DP4A", "1");
         }
         let Some(c) = ctx() else {
@@ -62674,8 +62672,8 @@ fn main() {
     #[test]
     #[ignore]
     fn wgpu_q2tp_mm_coop_affine_component_matrix() {
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         unsafe {
-            std::env::set_var("CMF_GPU", "wgpu");
             std::env::set_var("CMF_COOP", "1");
             std::env::set_var("CMF_Q2_COOP", "1");
         }
@@ -62852,7 +62850,7 @@ fn main() {
     /// can survive a wrong butterfly/sign placement for several tokens.
     #[test]
     fn wgpu_prism_fwht_matches_cpu_oracle() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -62951,7 +62949,7 @@ fn main() {
     /// width used by the model.
     #[test]
     fn wgpu_prism_fwht_matches_independent_f32_and_f16_widths() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -63113,7 +63111,7 @@ fn main() {
     /// descriptor is needed because the caller supplies the validated bit.
     #[test]
     fn wgpu_q2tp_mm_affine_matches_cpu_decode() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -63250,7 +63248,7 @@ fn main() {
     /// well under 1e-2 on these random rows; llama.cpp's activation grid).
     #[test]
     fn wgpu_q4tp_matvec4_bk8_tracks_the_f32_singles() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -63355,7 +63353,7 @@ fn main() {
     /// The vectorized f32 pair kernel against a host dot product.
     #[test]
     fn wgpu_matvec_pair_v4_matches_host() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -63436,7 +63434,7 @@ fn main() {
     /// same lanes, same groups, same order — the outputs must be bit-identical.
     #[test]
     fn wgpu_q4tp_matvec4_bk8s_is_bit_identical_to_bk8() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -63517,7 +63515,7 @@ fn main() {
     /// by element — the verify must land on the plain token's bits.
     #[test]
     fn wgpu_q4tp_matvec4_bku_matches_single_bits() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -63637,7 +63635,7 @@ fn main() {
     /// arm), batch 3, uneven rows — bit for bit.
     #[test]
     fn wgpu_q4tp_matvec4_bku_x2_matches_two_singles() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -63787,7 +63785,7 @@ fn main() {
     /// standalone `silu_mul_pre` result and fixed clamp/alpha host formula.
     #[test]
     fn wgpu_q4tp_moe_oai_matches_standalone_token_and_batch() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -64016,7 +64014,7 @@ fn main() {
     }
 
     fn gu_matches_three_dispatches(cols: usize, act_code: u32) {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -64182,7 +64180,7 @@ fn main() {
     /// then starts mid-word).
     #[test]
     fn wgpu_q8_2f_matvec4_matches_one_row() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -64295,7 +64293,7 @@ fn main() {
     /// and narrow shapes; the one-row kernel bounds it loosely.
     #[test]
     fn wgpu_q4tp_matvec16nl_matches_staged_ladder() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -64402,7 +64400,7 @@ fn main() {
     /// One-row, one-chunk and multi-chunk contexts; full and partial rope.
     #[test]
     fn wgpu_attend_dec_rkv_matches_rope_append_attend() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -64563,7 +64561,7 @@ fn main() {
     #[ignore]
     fn wgpu_q4tp_mv_variants() {
         use std::time::Instant;
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -64719,7 +64717,7 @@ fn main() {
     #[ignore]
     fn wgpu_q4tp_matvec_shape_bandwidth() {
         use std::time::Instant;
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -64982,7 +64980,7 @@ fn main() {
     /// have needed the scale in the first place.
     #[test]
     fn wgpu_q4tp_mm_coop_f16_device_scale_matches_scalar() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -65124,7 +65122,7 @@ fn main() {
     /// machine with a device; skips cleanly without one.
     #[test]
     fn wgpu_q4tp_mm_coop_matches_scalar() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -65240,7 +65238,7 @@ fn main() {
     /// batch that ends in a partial tile.
     #[test]
     fn wgpu_q4tp_mm_coop128_matches_coop64() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -65314,7 +65312,7 @@ fn main() {
     /// scale comes from the device reduction.
     #[test]
     fn wgpu_q82_mm_coop_matches_host() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -65425,7 +65423,7 @@ fn main() {
     #[ignore]
     fn wgpu_attn_block_timing() {
         use std::time::Instant;
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -65544,7 +65542,7 @@ fn main() {
 
     #[test]
     fn wgpu_q1t_matvec_matches_cpu_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q1t parity test");
             return;
@@ -65609,7 +65607,7 @@ fn main() {
 
     #[test]
     fn wgpu_q4b_matvec_matches_cpu_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q4b parity test");
             return;
@@ -65653,7 +65651,7 @@ fn main() {
 
     #[test]
     fn wgpu_q1t_matmat_matches_cpu_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q1t GEMM parity test");
             return;
@@ -65720,7 +65718,7 @@ fn main() {
 
     #[test]
     fn wgpu_q8_matmat_matches_cpu_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping matmat test");
             return;
@@ -65764,7 +65762,7 @@ fn main() {
     /// — every edge guard fires.
     #[test]
     fn wgpu_q8_mul_mm_matches_cpu_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping mul_mm test");
             return;
@@ -65807,7 +65805,7 @@ fn main() {
     #[test]
     fn wgpu_q1_mul_mm_matches_cpu_reference() {
         use cortiq_core::quant::{f16_to_f32, f32_to_f16};
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q1_mul_mm test");
             return;
@@ -65910,7 +65908,7 @@ fn main() {
     #[test]
     fn wgpu_q1g_kernels_equal_q1_bit_for_bit() {
         use cortiq_core::quant::{Q1_TILE, dequant_q1, f32_to_f16, repack_q1_to_q1g};
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping q1g parity test");
             return;
@@ -66054,7 +66052,7 @@ fn main() {
     #[test]
     #[ignore]
     fn q1g_matvec_speed() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;

@@ -750,7 +750,7 @@ mod tests {
     /// and the kernels are not.
     #[test]
     fn device_matvec_and_batch_match_the_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("SKIPPED (mxfp4 device matvec): no wgpu adapter");
             return;
@@ -896,7 +896,7 @@ mod tests {
         max_nrmse: f64,
         policy: Dsv41Segments,
     ) {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("SKIPPED ({tag}): no wgpu adapter");
             return;

@@ -786,7 +786,7 @@ mod tests {
     /// leave behind.
     #[test]
     fn o1_batch_matches_serial_steps() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping o1 batch test");
             return;
