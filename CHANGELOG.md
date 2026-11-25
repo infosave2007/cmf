@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The engine's lib tests no longer switch each other's GPU backend. The backend is re-read from `CMF_GPU` on
+  every op, and on macOS `CMF_GPU=1` selects Metal while `CMF_GPU=wgpu` selects wgpu; the Metal and wgpu
+  tests set it with no lock, so a Metal test running beside a MiMo bank test took wgpu away between the
+  bank's readiness check and the bank (`hybrid_bank_epoch_advances_at_dynamic_boundary`, "bank unavailable",
+  three master runs in a row on macos-latest). Every test that writes `CMF_GPU` — 16 Metal tests, 67 wgpu
+  tests, the four MTP tests that turn the GPU off — now holds one re-entrant guard (`gpu::test_gpu_env`) for
+  its whole body and gets the previous value back at the end; the bank tests hold it without writing
+  (`gpu::test_gpu_env_hold`), and a refused bank now panics with the placement's reason.
+
 ## [0.9.19] — 2026-11-24
 
 ### Added

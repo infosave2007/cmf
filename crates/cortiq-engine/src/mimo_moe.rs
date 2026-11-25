@@ -1997,9 +1997,13 @@ mod bank_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    /// One bank test at a time, and `CMF_GPU` held still for the whole test:
+    /// a parallel test that switched it (Metal tests set `CMF_GPU=1`) took
+    /// wgpu away between `bank_ready()` and the bank.
+    fn serial() -> (std::sync::MutexGuard<'static, ()>, crate::gpu::TestGpuEnv) {
         static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        GPU.lock().unwrap_or_else(|e| e.into_inner())
+        let bank = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        (bank, crate::gpu::test_gpu_env_hold())
     }
 
     /// Layer level: every routed call through an 8-slot bank equals the
@@ -2242,7 +2246,7 @@ mod bank_tests {
         let p = Pipeline::from_model(&model, SamplerConfig::default()).unwrap();
         let mut slot = bank(&p);
         let Slot::On(d) = &mut slot else {
-            panic!("bank unavailable")
+            panic!("bank unavailable: {}", last_decision())
         };
         // The first MoE layer (1) runs in the graph and never visits the
         // bank. Layer 2 must still release last round's eviction pins.
@@ -2286,7 +2290,7 @@ mod bank_tests {
         let mut slot = bank(&p);
         assert_eq!(slot.graph_prefix_end(), Some(1));
         let Slot::On(d) = &mut slot else {
-            panic!("bank unavailable")
+            panic!("bank unavailable: {}", last_decision())
         };
         let bank_arc = d.bank.clone();
         {

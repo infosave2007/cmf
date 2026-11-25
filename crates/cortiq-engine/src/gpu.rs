@@ -1291,6 +1291,68 @@ impl Drop for GpuPause {
     }
 }
 
+/// The engine's lib tests share one process, and the backend is re-read from
+/// `CMF_GPU` on every op: on macOS `CMF_GPU=1` selects Metal and `CMF_GPU=wgpu`
+/// selects wgpu. A test that wrote the variable while another test ran on the
+/// other backend switched that test's device under it (the MiMo bank tests
+/// lost wgpu between their readiness check and the bank, three master runs in
+/// a row on macOS). Every test that writes `CMF_GPU` holds a [`TestGpuEnv`]
+/// for its whole body, and so does every test that needs the value to stay
+/// put: one holder at a time, the previous value restored at the end.
+/// Re-entrant on the holding thread, so a test's helpers may take it again.
+#[cfg(test)]
+static TEST_GPU_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GPU_ENV_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// See [`TEST_GPU_ENV`]: holds the lock and restores `CMF_GPU` on drop.
+#[cfg(test)]
+pub(crate) struct TestGpuEnv {
+    previous: Option<std::ffi::OsString>,
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+fn test_gpu_env_enter(value: Option<&str>) -> TestGpuEnv {
+    let lock = (TEST_GPU_ENV_DEPTH.get() == 0)
+        .then(|| TEST_GPU_ENV.lock().unwrap_or_else(|e| e.into_inner()));
+    TEST_GPU_ENV_DEPTH.set(TEST_GPU_ENV_DEPTH.get() + 1);
+    let previous = std::env::var_os("CMF_GPU");
+    if let Some(value) = value {
+        unsafe { std::env::set_var("CMF_GPU", value) };
+    }
+    TestGpuEnv { previous, _lock: lock }
+}
+
+/// Set `CMF_GPU` for the rest of the calling test (see [`TEST_GPU_ENV`]).
+#[cfg(test)]
+pub(crate) fn test_gpu_env(value: &str) -> TestGpuEnv {
+    test_gpu_env_enter(Some(value))
+}
+
+/// Keep `CMF_GPU` as it is for the rest of the calling test: no other test
+/// writes it meanwhile (see [`TEST_GPU_ENV`]).
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) fn test_gpu_env_hold() -> TestGpuEnv {
+    test_gpu_env_enter(None)
+}
+
+#[cfg(test)]
+impl Drop for TestGpuEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CMF_GPU", value),
+                None => std::env::remove_var("CMF_GPU"),
+            }
+        }
+        TEST_GPU_ENV_DEPTH.set(TEST_GPU_ENV_DEPTH.get() - 1);
+    }
+}
+
 pub fn enabled() -> bool {
     !GPU_LOST.load(std::sync::atomic::Ordering::Relaxed) && !GPU_PAUSED.paused() && backend() != Backend::None
 }

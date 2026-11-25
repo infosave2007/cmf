@@ -1381,7 +1381,7 @@ mod tests {
     /// the r = 8 edge, and a non-multiple-of-64 row count.
     #[test]
     fn wgpu_blr_matches_cpu_kernels() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping blr parity test");
             return;
@@ -1479,7 +1479,7 @@ mod tests {
     #[test]
     #[ignore]
     fn wgpu_blr_graph_throughput_27b_shapes() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
             return;
@@ -1670,7 +1670,7 @@ mod tests {
     /// and workgroup memory) when the device has 32-wide subgroups.
     #[test]
     fn wgpu_blr_graph_kernels_match_dequant() {
-        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let _gpu_env = crate::gpu::test_gpu_env("wgpu");
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping blr graph kernel test");
             return;

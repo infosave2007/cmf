@@ -27430,7 +27430,7 @@ mod tests {
 
     #[test]
     fn swiglu_oai_m3_single_and_resident_kernels_match_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -27518,7 +27518,7 @@ mod tests {
     /// leaves it out of the attention-importance normalizer.
     #[test]
     fn gqa_attend_learned_sink_is_value_less_and_normalizes_importance() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -27689,7 +27689,7 @@ mod tests {
     #[test]
     #[ignore = "timing probe; run explicitly on a quiet machine"]
     fn gdn_state4_bench_27b_shape() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -27769,7 +27769,7 @@ mod tests {
     /// and the prefill fold (mode 3) write the bit-identical state.
     #[test]
     fn gdn_state4_matches_legacy_and_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -27860,7 +27860,7 @@ mod tests {
     /// a REAL mmap (no-copy buffer). Skipped without a Metal device.
     #[test]
     fn gpu_q8_matvec_matches_cpu() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -28010,7 +28010,7 @@ mod tests {
     /// byte-loader path. Skipped without a Metal device.
     #[test]
     fn gpu_q4t_matvec_matches_reference() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -28187,7 +28187,7 @@ mod tests {
     }
 
     fn gpu_q1_case(rows: usize, cols: usize) {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -28360,7 +28360,7 @@ mod tests {
         let _lock = Q1_OVERRIDE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -28467,7 +28467,7 @@ mod tests {
     /// (gates first, shared at k, ups after, shared up last).
     #[test]
     fn moe_topk_select_matches_cpu_route() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -28611,7 +28611,7 @@ mod tests {
     /// contents (which used to look like the old `1e-6` behavior).
     #[test]
     fn moe_topk_select_honors_flint_sigmoid_denom_eps() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -28722,7 +28722,7 @@ mod tests {
             eprintln!("MELLUM_CMF unset");
             return;
         };
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let c = ctx().expect("metal");
         let model = Arc::new(CmfModel::open(&path).expect("open"));
         let (fbuf, _safe) = file_buffer(c, &model).expect("arena");
@@ -29034,7 +29034,7 @@ mod tests {
     /// both), with and without the shared slot (flag 32: Mellum2.1).
     #[test]
     fn moe_topk_select_sg_matches_serial() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -29152,7 +29152,7 @@ mod tests {
         use cortiq_core::quant::{
             Q4TP_NIB, dequant_q4tp, f32_to_f16, q4tp_put_code, q4tp_sections,
         };
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -29430,7 +29430,7 @@ mod replay_queue_tests {
     /// copies the buffer out. The copy must see B's bytes.
     #[test]
     fn shared_event_orders_queue_b_before_queue_a() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -29482,7 +29482,7 @@ mod replay_queue_tests {
     /// the slot is empty; a second wait is a no-op.
     #[test]
     fn wait_replay_collects_the_parked_buffer() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
@@ -29541,7 +29541,7 @@ mod argmax_rows_tests {
     /// shorter than the stride, planted ties, a −∞ tail and a NaN.
     #[test]
     fn argmax_rows_matches_the_host_argmax() {
-        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let _gpu_env = crate::gpu::test_gpu_env("1");
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
             return;
