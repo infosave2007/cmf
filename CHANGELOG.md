@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.20] — 2026-11-25
+
 ### Fixed
 - wgpu, a stack the weight budget splits (an 8 GB Radeon RX Vega 56 under SenseNova-Loop-9B q4tp, reported
   from Windows): every speculative round drafted its tokens and then had its verify refused (the whole stack
