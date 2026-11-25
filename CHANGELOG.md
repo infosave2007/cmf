@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.20] — 2026-11-25
+
 ### Fixed
+- wgpu, a stack the weight budget splits (an 8 GB Radeon RX Vega 56 under SenseNova-Loop-9B q4tp, reported
+  from Windows): every speculative round drafted its tokens and then had its verify refused (the whole stack
+  does not fit), so `--greedy` paid for drafts it could never check and reported "0 of 54 accepted". A verify
+  the budget refuses now turns the drafts off for the model, its drafts leave the count, and later prompts no
+  longer warm the head. Out of device memory outside an error scope (a long conversation in `cortiq serve`)
+  ended the process through wgpu's default handler; it now turns the GPU path off, ends that request with an
+  error and leaves the server running on the CPU. A split stack's K/V mirrors grow 1024 positions at a time
+  instead of to the next power of two, so they hold at most a block of unused room.
 - The engine's lib tests no longer switch each other's GPU backend. The backend is re-read from `CMF_GPU` on
   every op, and on macOS `CMF_GPU=1` selects Metal while `CMF_GPU=wgpu` selects wgpu; the Metal and wgpu
   tests set it with no lock, so a Metal test running beside a MiMo bank test took wgpu away between the

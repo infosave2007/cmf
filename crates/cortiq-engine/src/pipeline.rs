@@ -402,6 +402,10 @@ pub struct Pipeline {
     /// and the position it was measured at. A later request's trial decides
     /// from it instead of decoding eight plain tokens again.
     spec_plain_ms: (f64, usize),
+    /// wgpu: the batch graph refused a verify because the whole stack does not fit
+    /// the weight budget (a device prefix runs the rest on the host): the drafts
+    /// stay off for this model, their rounds could never be checked.
+    spec_over_budget: bool,
     /// The same for the DFlash drafter's rounds, and whether the last round
     /// was one of them.
     pub dflash_hold: [f32; 7],
@@ -4964,6 +4968,7 @@ impl Pipeline {
             spec_wall_n: [0; 7],
             spec_k_dwell: 0,
             spec_plain_ms: (0.0, 0),
+            spec_over_budget: false,
             dflash_hold: DFLASH_HOLD_PRIOR,
             dflash_last: false,
             dflash_wait: 0,
@@ -7213,6 +7218,8 @@ impl Pipeline {
             && task_mask.is_none()
             && self.dyn_router.is_none()
             && (!self.o1_active() || self.o1_spec())
+            // a card the verify does not fit: the head is not even warmed over the prompt
+            && !(graph_spec && self.spec_over_budget)
             && ((!graph_on && pair_pays && self.sampler_config.temperature < 1e-6) || graph_spec);
         // The MTP module is detached during generation so its mutable
         // state does not fight the borrow on `self`.
@@ -9059,10 +9066,12 @@ impl Pipeline {
                 Some(m)
                     if graph_spec
                         && !spec_watchdog_off
+                        && !self.spec_over_budget
                         && generated + 1 < max_tokens
                         && next_pos > 0 =>
                 {
                     let t_round = std::time::Instant::now();
+                    let drafted0 = drafted;
                     if spec_time_level() >= 2 {
                         if let Some(t) = spec_round_end.take() {
                             eprintln!(
@@ -9200,6 +9209,19 @@ impl Pipeline {
                         // one explicit error to the caller.
                         self.finish_generation(&mut mtp, &mut router, true);
                         return Err("GPU MTP graph failed during speculative decode".to_string());
+                    }
+                    // A verify the weight budget refuses (the stack does not fit the card,
+                    // a device prefix runs the rest on the host) is refused every time:
+                    // the round's drafts were never checked, so they leave the count, and
+                    // no draft is made for this model again (an 8 GB Radeon reported "0 of
+                    // 54 accepted" while every round paid for its drafts).
+                    if crate::gpu::batch_graph_over_budget() {
+                        drafted = drafted0;
+                        self.spec_over_budget = true;
+                        tracing::info!("drafts off: a verify does not fit the weight budget");
+                        hidden = self.forward_layers(&self.embed_single(t_next), next_pos, task_mask);
+                        next_pos += 1;
+                        continue 'decode;
                     }
                     // Declined (batch graph refused): plain forward below —
                     // and a round that produced one token for the trial's
@@ -23156,6 +23178,18 @@ impl Pipeline {
             let built = self.try_token_graph_wgpu(hidden, position, &mut lg, &mut gl);
             let declined = built.is_none();
             let built = match built {
+                // The card ran out of memory in this call (`gpu::mark_lost`): its rows and
+                // states for this sequence are gone with it, so the request ends here
+                // with an error, the next one runs on the host.
+                Some(_) if crate::gpu::device_lost() => {
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!("the GPU ran out of memory in the token graph; request stopped, later ones run on the CPU");
+                    return vec![0.0; self.hidden_size];
+                }
                 Some(Ok(hh)) => Some(hh),
                 Some(Err(())) => {
                     // O(1) state was admitted before the device failure; the
@@ -23248,6 +23282,15 @@ impl Pipeline {
             let span_res =
                 self.try_token_graph_wgpu_span(hidden, position, &mut lg, from, upto_excl, &mut gl);
             let span_res = match span_res {
+                Some(_) if crate::gpu::device_lost() => {
+                    self.clear_sequence_state();
+                    self.graph_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.cancel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!("the GPU ran out of memory in the span graph; request stopped, later ones run on the CPU");
+                    return vec![0.0; self.hidden_size];
+                }
                 Some(Ok(hh)) => Some(hh),
                 Some(Err(())) => {
                     self.clear_sequence_state();
