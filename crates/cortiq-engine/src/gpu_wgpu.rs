@@ -21732,6 +21732,14 @@ pub(crate) fn set_kv_step(rows: usize) {
     KV_STEP.store(rows, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// A stack the weight budget splits leaves the card little room besides its weights:
+/// its mirrors grow a block at a time from here on, not to the next power of two (an
+/// 8 GB Radeon under SenseNova-Loop-9B ran out of memory in `cortiq serve` when a long
+/// conversation's mirrors doubled). A step a model asked for stays.
+fn kv_step_for_split_stack() {
+    let _ = KV_STEP.compare_exchange(0, 1024, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn kv_capacity(limit: usize, need: usize) -> usize {
     let step = KV_STEP.load(std::sync::atomic::Ordering::Relaxed);
     if step > 0 {
@@ -23231,6 +23239,17 @@ fn init(dev: usize) -> Result<Ctx, String> {
         ..Default::default()
     }))
     .map_err(|e| format!("request_device: {e}"))?;
+    // Out of device memory outside an error scope (a long conversation's
+    // mirrors on an 8 GB card, `cortiq serve`): the GPU path goes off and the
+    // run continues on the host, where wgpu's default handler ended the
+    // process. Any other uncaptured error stays fatal, as before.
+    // The errors that follow from the failed allocation once the path is off
+    // are logged, not raised: the request ends with an error and the server lives.
+    device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| match e {
+        wgpu::Error::OutOfMemory { .. } => crate::gpu::mark_lost("out of device memory"),
+        other if crate::gpu::device_lost() => tracing::debug!("wgpu error after the device was given up: {other}"),
+        other => panic!("wgpu error: {other}"),
+    }));
     // Every shader-module and pipeline validation error below must fail
     // init: an invalid pipeline silently turns its dispatches into
     // no-ops and the graph decodes garbage (seen on phones before this
@@ -30855,6 +30874,7 @@ pub fn forward_token_graph(
             graph_decline("the device prefix would end inside an mHC range");
             return token_graph_outcome(o1_started || state_started, false);
         }
+        kv_step_for_split_stack();
         // The multi-step tail (on-device argmax + re-embed) needs the head,
         // which a prefix does not reach — those callers fall back whole.
         if steps > 1 || ids_out.is_some() {
@@ -37160,6 +37180,7 @@ pub fn forward_batch_graph_at(
     let t_bfn = std::time::Instant::now();
     // `set_batch_defer` arms this call only.
     let defer_req = BATCH_DEFER.with(|f| f.replace(false));
+    BATCH_OVER_BUDGET.with(|f| f.set(false));
     // Once sealed O(1) views have been admitted and uploaded, a failed batch
     // cannot safely fall through to the CPU path: the device state may have
     // advanced while the CPU copy is intentionally stale. All refusals before
@@ -37365,6 +37386,8 @@ pub fn forward_batch_graph_at(
     if live_bytes > graph_live_budget {
         if !prefix_ok {
             bgraph_refused("all-layer live set exceeds the weight budget");
+            BATCH_OVER_BUDGET.with(|f| f.set(true));
+            kv_step_for_split_stack();
             return batch_outcome(o1_started || state_started, false);
         }
         let mut acc = 0u64;
@@ -37395,6 +37418,7 @@ pub fn forward_batch_graph_at(
             bgraph_refused("the device prefix would end inside an mHC range");
             return batch_outcome(o1_started || state_started, false);
         }
+        kv_step_for_split_stack();
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static SAID: AtomicBool = AtomicBool::new(false);
@@ -56653,6 +56677,18 @@ fn o1_qcap_buffer(c: &Ctx, layer: usize, positions: &[usize], row: usize) -> Opt
         q.bufs.push((layer, floats, b.clone()));
         Some(QCapSlot { buf: b, dst, row })
     })
+}
+
+thread_local! {
+    /// The last batch graph call on this thread was refused for the weight budget
+    /// with no device prefix to fall back on (a verify, `batch_over_budget`).
+    static BATCH_OVER_BUDGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread's last batch graph call was refused because the whole stack
+/// does not fit the weight budget: a speculative verify can never run on this card.
+pub fn batch_over_budget() -> bool {
+    BATCH_OVER_BUDGET.with(|f| f.get())
 }
 
 /// The two-stream mHC streams the last graph left on the card for its first `rows` rows

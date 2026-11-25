@@ -1363,6 +1363,11 @@ pub fn enabled() -> bool {
 /// wgpu, the other threads on its poisoned lock, and the process hung).
 static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether `mark_lost` turned the GPU path off for this process.
+pub fn device_lost() -> bool {
+    GPU_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The device is lost (`why`: what found it): the GPU path is off for good.
 pub fn mark_lost(why: &str) {
     if !GPU_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -3408,6 +3413,16 @@ pub fn o1_qcap_begin(_layers: &[usize]) -> bool {
     #[cfg(feature = "cuda")]
     if backend() == Backend::Cuda {
         return crate::gpu_cuda::o1_qcap_begin(_layers);
+    }
+    false
+}
+
+/// The last wgpu batch graph call on this thread was refused for the weight budget,
+/// with no device prefix to fall back on: a verify can never run on this card.
+pub fn batch_graph_over_budget() -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::batch_over_budget();
     }
     false
 }
