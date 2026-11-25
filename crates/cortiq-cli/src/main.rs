@@ -2692,9 +2692,11 @@ enum Commands {
     /// lm-eval `loglikelihood` on the engine: log P(continuation | context)
     /// and is_greedy for every {"context", "continuation"} JSONL request,
     /// on the BACKBONE pipeline (no lane, router or lookup; CMF_GROWTH=off
-    /// keeps growth records out). Tokens split as lm-eval HFLM does;
-    /// consecutive equal contexts are forwarded once and their
-    /// continuations walked as a token trie with KV rollback. Output: one
+    /// keeps growth records out). Tokens split as lm-eval HFLM does; on a
+    /// CUDA or wgpu backend every request runs on the batch graph, the head
+    /// on the card; on the host consecutive equal contexts are forwarded
+    /// once and their continuations walked as a token trie with KV
+    /// rollback. Output: one
     /// JSONL line per request {"i","logprob","is_greedy","n_ctx","n_cont"}
     /// plus the request's other fields.
     Loglik {
@@ -2713,10 +2715,13 @@ enum Commands {
         /// (context as a cmf-im-v1 user turn, continuation as the answer)
         #[arg(long, default_value = "raw")]
         frame: String,
-        /// shared (one context forward per group, the continuations walked
-        /// as a token trie with KV rollback) | full (nll_ids_from per
-        /// request: the slow cross-check, no is_greedy)
-        #[arg(long, default_value = "shared")]
+        /// auto (device where the backend and the model admit it, shared
+        /// otherwise) | device (each request on the CUDA/wgpu batch graph,
+        /// final norm and lm_head on the card) | shared (host: one context
+        /// forward per group, the continuations walked as a token trie with
+        /// KV rollback) | full (nll_ids_from per request: the slow
+        /// cross-check, no is_greedy)
+        #[arg(long, default_value = "auto")]
         scorer: String,
         /// Prepend the tokenizer's BOS when it declares one
         #[arg(long)]

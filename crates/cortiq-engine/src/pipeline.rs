@@ -1332,6 +1332,19 @@ enum MetalPrefillOutcome {
     Completed(Vec<f32>),
 }
 
+/// One teacher-forced position of [`Pipeline::score_ids_device`]: the
+/// target's natural-log probability and whether it is the argmax (the
+/// first maximum on ties, as torch's `argmax`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenScore {
+    pub logprob: f64,
+    pub greedy: bool,
+}
+
+/// Rows a verify window of the device scorer carries: the CUDA hybrid
+/// arm's small path (`NMAX`), the widest window it runs with a head.
+pub const DEVICE_SCORE_ROWS: usize = 16;
+
 #[cfg(target_os = "macos")]
 enum MetalBatchNllOutcome {
     Declined,
@@ -14776,6 +14789,193 @@ impl Pipeline {
         }
         attention::recycle_buf(&mut logits);
         tok_nll
+    }
+
+    /// Why the device scorer ([`Self::score_ids_device`]) does not take
+    /// this pipeline, `None` when it does: a CUDA or wgpu backend with the
+    /// batch graph, a plain head the verify tail can run, and none of the
+    /// architectures that score through a stack of their own.
+    pub fn device_score_decline(&self) -> Option<&'static str> {
+        if !crate::gpu::enabled_here() || !(crate::gpu::cuda_active() || crate::gpu::wgpu_active()) {
+            return Some("no CUDA or wgpu backend in use");
+        }
+        if !crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill) {
+            return Some("the batch graph is off on this device");
+        }
+        if self.graph_refused() {
+            return Some("the token graph is refused for this pipeline");
+        }
+        if self.o1_active() {
+            return Some("an O(1) far field");
+        }
+        if self.dory.is_some()
+            || self.hy4.is_some()
+            || self.maxwell.is_some()
+            || self.inkling.is_some()
+            || self.dash.is_some()
+            || self.dsv41.is_some()
+            || self.is_block_diffusion()
+            || self.embryo_resident_eligible()
+        {
+            return Some("an architecture with its own stack");
+        }
+        if self.head_clusters.is_some() {
+            return Some("a hierarchical head");
+        }
+        if self.weights.lm_head.has_prism_contract() || self.weights.lm_head.graph_weight().is_none() {
+            return Some("the lm_head has no plain graph weight");
+        }
+        None
+    }
+
+    /// Teacher-forced scores of `ids[start + 1..]` on the device batch
+    /// graph (CUDA or wgpu): each target's log-probability given every id
+    /// before it, and whether it is the argmax. The positions before
+    /// `start` ride prompt chunks of `generation_batch_k` rows with no
+    /// head; the scored rows go through verify windows of
+    /// [`DEVICE_SCORE_ROWS`], whose final norm and lm_head run on the card,
+    /// so only their logits come back. `Ok(None)`: the device route does
+    /// not take this pipeline and nothing ran (the caller keeps its host
+    /// scorer). Once a chunk has completed, the device owns the sequence:
+    /// a later decline is an error, never a silent host fallback.
+    pub fn score_ids_device(&mut self, ids: &[u32], start: usize) -> Result<Option<Vec<TokenScore>>, String> {
+        let n = ids.len();
+        if start + 1 >= n {
+            return Err(format!("device scorer: start {start} leaves no target among {n} ids"));
+        }
+        if self.device_score_decline().is_some() {
+            return Ok(None);
+        }
+        if n > self.kv_cache.max_seq_len {
+            return Err(format!(
+                "device scorer: {n} ids exceed the context of {} positions",
+                self.kv_cache.max_seq_len
+            ));
+        }
+        let lm_rows = self.weights.lm_head.rows();
+        let vocab = self.vocab_size.min(lm_rows);
+        if let Some(&bad) = ids[start + 1..].iter().find(|&&t| t as usize >= vocab) {
+            return Err(format!("device scorer: target {bad} outside the head's {vocab} rows"));
+        }
+        self.nll_begin()?;
+        let hs = self.hidden_size;
+        let mut ran = false;
+        // what a decline means: nothing on the device yet, or a broken sequence
+        let declined = |p: &mut Self, ran: bool, at: usize| -> Result<Option<Vec<TokenScore>>, String> {
+            p.nll_end();
+            if ran {
+                Err(format!("device scorer: the batch graph declined at position {at} after earlier chunks ran"))
+            } else {
+                Ok(None)
+            }
+        };
+        let chunk = match self.generation_batch_k() {
+            0 => 128,
+            k => k,
+        };
+        let mut pos = 0usize;
+        while pos < start {
+            let end = (pos + chunk).min(start);
+            let k = end - pos;
+            let mut h = vec![0f32; k * hs];
+            for (r, &id) in ids[pos..end].iter().enumerate() {
+                h[r * hs..(r + 1) * hs].copy_from_slice(&self.embed_single(id));
+            }
+            let positions: Vec<usize> = (pos..end).collect();
+            let outcome = self.try_batch_graph_wgpu(&mut h, &positions, k, None);
+            if let Err(e) = self.nll_check_graph("device score prefix", pos) {
+                self.nll_end();
+                return Err(e);
+            }
+            match outcome {
+                crate::gpu::BatchGraphOutcome::Completed => ran = true,
+                crate::gpu::BatchGraphOutcome::Declined => return declined(self, ran, pos),
+                crate::gpu::BatchGraphOutcome::Failed => {
+                    self.nll_end();
+                    return Err(format!("device scorer: the batch graph failed at position {pos}"));
+                }
+            }
+            pos = end;
+        }
+        let mut out = Vec::with_capacity(n - 1 - start);
+        let mut logits = Vec::new();
+        while pos < n - 1 {
+            let end = (pos + DEVICE_SCORE_ROWS).min(n - 1);
+            let w = end - pos;
+            let mut h = vec![0f32; w * hs];
+            for (r, &id) in ids[pos..end].iter().enumerate() {
+                h[r * hs..(r + 1) * hs].copy_from_slice(&self.embed_single(id));
+            }
+            let positions: Vec<usize> = (pos..end).collect();
+            let outcome = match self.weights.lm_head.graph_weight() {
+                Some((_, idx, kind, row_scale)) => self.try_batch_graph_wgpu(
+                    &mut h,
+                    &positions,
+                    w,
+                    Some(crate::gpu::SpecTail {
+                        lm: crate::gpu::GraphW {
+                            idx,
+                            kind,
+                            row_scale,
+                            data: &[],
+                            prism: crate::gpu::GraphPrismOp::None,
+                            affine: false,
+                        },
+                        lm_rows,
+                        final_norm: &self.weights.final_norm,
+                        logits_out: &mut logits,
+                        pick: None,
+                    }),
+                ),
+                None => crate::gpu::BatchGraphOutcome::Declined,
+            };
+            if let Err(e) = self.nll_check_graph("device score window", pos) {
+                self.nll_end();
+                return Err(e);
+            }
+            match outcome {
+                crate::gpu::BatchGraphOutcome::Completed if logits.len() >= w * lm_rows => ran = true,
+                crate::gpu::BatchGraphOutcome::Declined => return declined(self, ran, pos),
+                _ => {
+                    self.nll_end();
+                    return Err(format!(
+                        "device scorer: the verify window at position {pos} failed or returned {} of {} logits",
+                        logits.len(),
+                        w * lm_rows
+                    ));
+                }
+            }
+            // the multiplier and the soft cap the host head applies
+            // (`lm_head_forward`); the verify tail stops at the GEMM
+            let (mu, cap) = (self.logit_multiplier, self.final_softcap);
+            let mut rows: Vec<&mut [f32]> = logits.chunks_mut(lm_rows).take(w).map(|r| &mut r[..vocab]).collect();
+            let mut scored = vec![TokenScore { logprob: 0.0, greedy: false }; w];
+            std::thread::scope(|s| {
+                for (r, (lg, sc)) in rows.iter_mut().zip(scored.iter_mut()).enumerate() {
+                    let target = ids[pos + r + 1] as usize;
+                    s.spawn(move || {
+                        if let Some(mu) = mu {
+                            lg.iter_mut().for_each(|v| *v *= mu);
+                        }
+                        if let Some(c) = cap {
+                            softcap_in_place(lg, c, None);
+                        }
+                        let (mut top, mut max) = (0usize, f32::NEG_INFINITY);
+                        for (i, &v) in lg.iter().enumerate() {
+                            if v > max {
+                                (top, max) = (i, v);
+                            }
+                        }
+                        let lse = lg.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln() + max as f64;
+                        *sc = TokenScore { logprob: lg[target] as f64 - lse, greedy: top == target };
+                    });
+                }
+            });
+            out.extend(scored);
+            pos = end;
+        }
+        self.nll_end();
+        Ok(Some(out))
     }
 
     /// `CMF_STATE_TRACE`: per-layer magnitude of the recurrent record at

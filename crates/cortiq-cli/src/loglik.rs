@@ -22,17 +22,23 @@
 //! the default `raw` scores plain text, as lm-eval does without
 //! `--apply_chat_template`.
 //!
-//! Scoring (`--scorer shared`, the default): consecutive requests with
-//! the same context tokens form a group; the context is forwarded once,
-//! the continuations are laid out as a token trie and walked depth-first
-//! with the host KV state rolled back between siblings — the walk of
-//! `probe-choice`, extended with the greedy check. `--scorer full`
-//! re-forwards `context + continuation` per request through the engine's
-//! `nll_ids_from` (the slow cross-check; `is_greedy` is then null).
+//! Scoring. `--scorer device`: every `context + continuation` runs on the
+//! CUDA or wgpu batch graph (`Pipeline::score_ids_device`): the context as
+//! prompt chunks, the continuation rows in short verify windows whose final
+//! norm and lm_head run on the card; the host reads back only those rows'
+//! logits. `--scorer shared`: consecutive requests with the same context
+//! tokens form a group; the context is forwarded once, the continuations
+//! are laid out as a token trie and walked depth-first with the host KV
+//! state rolled back between siblings — the walk of `probe-choice`,
+//! extended with the greedy check (per-op on the host route: the KV
+//! snapshot lives on the host). `--scorer auto`, the default: `device`
+//! when the backend and the model admit it, `shared` otherwise.
+//! `--scorer full` re-forwards `context + continuation` per request
+//! through the engine's `nll_ids_from` (the slow cross-check; `is_greedy`
+//! is then null).
 //!
 //! Always the BACKBONE pipeline (no skill lane, no router, no lookup
 //! table); `CMF_GROWTH=off` keeps growth records out of the forward.
-//! Runs per-op on the host route (the KV snapshot lives on the host).
 
 use crate::choice::{log_sum_exp, Trie};
 use anyhow::Context;
@@ -49,7 +55,7 @@ pub struct LoglikArgs<'a> {
     pub split: &'a str,
     /// `raw` | `chat`.
     pub frame: &'a str,
-    /// `shared` | `full`.
+    /// `auto` | `device` | `shared` | `full`.
     pub scorer: &'a str,
     pub bos: bool,
 }
@@ -258,6 +264,30 @@ pub fn score_full(p: &mut Pipeline, ctx: &[u32], cont: &[u32]) -> anyhow::Result
     })
 }
 
+/// `context + continuation` on the device batch graph (one fresh
+/// sequence); `Ok(None)` when the device route does not take the pipeline.
+pub fn score_device(p: &mut Pipeline, ctx: &[u32], cont: &[u32]) -> anyhow::Result<Option<Scored>> {
+    let mut all = Vec::with_capacity(ctx.len() + cont.len());
+    all.extend_from_slice(ctx);
+    all.extend_from_slice(cont);
+    let Some(rows) = p
+        .score_ids_device(&all, ctx.len() - 1)
+        .map_err(|e| anyhow::anyhow!(e))?
+    else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        rows.len() == cont.len(),
+        "the device scorer scored {} positions for a {}-token continuation",
+        rows.len(),
+        cont.len()
+    );
+    Ok(Some(Scored {
+        logprob: rows.iter().map(|r| r.logprob).sum(),
+        is_greedy: Some(rows.iter().all(|r| r.greedy)),
+    }))
+}
+
 /// Runs of consecutive equal contexts: `(start, end)` index ranges.
 pub fn context_groups(ctxs: &[Vec<u32>]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
@@ -278,10 +308,10 @@ pub fn cmd_loglik(a: LoglikArgs<'_>) -> anyhow::Result<()> {
         "chat" => true,
         other => anyhow::bail!("--frame {other}: expected raw | chat"),
     };
-    let scorer = a.scorer.trim().to_ascii_lowercase();
+    let mut scorer = a.scorer.trim().to_ascii_lowercase();
     anyhow::ensure!(
-        matches!(scorer.as_str(), "shared" | "full"),
-        "--scorer {scorer}: expected shared | full"
+        matches!(scorer.as_str(), "auto" | "device" | "shared" | "full"),
+        "--scorer {scorer}: expected auto | device | shared | full"
     );
     let reqs = parse_requests(
         &std::fs::read_to_string(a.requests_jsonl).with_context(|| a.requests_jsonl.to_string())?,
@@ -289,7 +319,21 @@ pub fn cmd_loglik(a: LoglikArgs<'_>) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(a.model).with_context(|| a.model.to_string())?);
     let mut p = Pipeline::from_model_with_skill(&model, SamplerConfig::default(), None)
         .context("loading the backbone pipeline")?;
-    p.mark_graph_refused();
+    // `auto` takes the device batch graph where the pipeline admits it; the
+    // host scorers refuse the token graph (their KV snapshot is the host's)
+    if matches!(scorer.as_str(), "auto" | "device") {
+        match p.device_score_decline() {
+            None => scorer = "device".into(),
+            Some(why) if scorer == "device" => anyhow::bail!("--scorer device: {why}"),
+            Some(why) => {
+                eprintln!("loglik: the device scorer does not take this pipeline ({why}); host trie walk");
+                scorer = "shared".into();
+            }
+        }
+    }
+    if scorer != "device" {
+        p.mark_graph_refused();
+    }
     let tok = p.tokenizer.clone();
     let eot = tok.token_to_id("<|endoftext|>").or(tok.eos_token_id);
     let encode = |s: &str| tok.encode(s);
@@ -332,7 +376,7 @@ pub fn cmd_loglik(a: LoglikArgs<'_>) -> anyhow::Result<()> {
         groups.len(),
         a.split,
         a.frame,
-        a.scorer,
+        scorer,
         a.bos,
         std::env::var("CMF_GPU").unwrap_or_else(|_| "unset".into())
     );
@@ -346,12 +390,31 @@ pub fn cmd_loglik(a: LoglikArgs<'_>) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let mut last_report = 0usize;
     for &(s, e) in &groups {
-        let scored: Vec<Scored> = match scorer.as_str() {
-            "full" => (s..e)
-                .map(|i| score_full(&mut p, &ctxs[i], &conts[i]))
-                .collect::<anyhow::Result<_>>()?,
-            _ => score_group(&mut p, &ctxs[s], &conts[s..e])?,
-        };
+        let mut scored: Vec<Scored> = Vec::with_capacity(e - s);
+        if scorer == "device" {
+            for i in s..e {
+                match score_device(&mut p, &ctxs[i], &conts[i])? {
+                    Some(sc) => scored.push(sc),
+                    // the batch graph refused the stack before anything ran:
+                    // `auto` keeps the host walk from the first request on
+                    None if i == 0 && a.scorer.trim().eq_ignore_ascii_case("auto") => {
+                        eprintln!("loglik: the batch graph declined this model; host trie walk");
+                        scorer = "shared".into();
+                        p.mark_graph_refused();
+                        break;
+                    }
+                    None => anyhow::bail!("request {i}: the device batch graph declined"),
+                }
+            }
+        }
+        if scorer != "device" {
+            scored = match scorer.as_str() {
+                "full" => (s..e)
+                    .map(|i| score_full(&mut p, &ctxs[i], &conts[i]))
+                    .collect::<anyhow::Result<_>>()?,
+                _ => score_group(&mut p, &ctxs[s], &conts[s..e])?,
+            };
+        }
         for (j, sc) in scored.into_iter().enumerate() {
             let i = s + j;
             let mut o = reqs[i].echo.clone();

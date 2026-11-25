@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cortiq loglik --scorer device`: every request on the CUDA or wgpu (Vulkan) batch graph. The context runs as prompt
+  chunks, the continuation rows in 16-row verify windows whose final norm and lm_head run on the card, so only those
+  rows' logits come back. `--scorer auto` (the new default) takes it where the backend and the model admit it and
+  keeps the host trie walk otherwise; before, loglik refused the token graph and a Qwen3.5/3.8 model scored on the
+  CPU even with `CMF_GPU=cuda`. BotPsy-0.8B q8_2f (qwen3_5), 150 requests with 2.5k-character contexts, RTX PRO 6000:
+  host 289 s, CUDA 31.5 s, Vulkan 43.6 s. Against the exact host path (`CMF_SDOT=0`) CUDA and Vulkan are within
+  0.0001 nat per token; the default host walk (int8 activations) is off by up to 3.6 nat on a short low-probability
+  span.
+
 ## [0.9.20] — 2026-11-25
 
 ### Fixed
