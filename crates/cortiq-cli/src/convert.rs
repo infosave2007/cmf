@@ -10008,6 +10008,27 @@ pub fn run_convert_multi_excluding(
         progress(1.0);
         return Ok(());
     }
+    // GigaAM-v4: a speech encoder with RNN-T or CTC heads and its own packer.
+    if let Some(dir) = Some(Path::new(model)).filter(|d| {
+        fs::read(d.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|c| crate::gigaampack::detect(&c))
+    }) {
+        anyhow::ensure!(
+            defrag.is_none()
+                && o1_hint.is_none()
+                && !resume
+                && towers == MimoTowers::TextOnly
+                && exclusion.is_empty(),
+            "gigaam: --defrag, --o1, --resume, --mimo-towers and --exclude-tensors do not apply"
+        );
+        for (q, path) in outputs {
+            crate::gigaampack::convert(dir, q, path)?;
+        }
+        progress(1.0);
+        return Ok(());
+    }
     // Inkling-2-Mini: a looped stack with block attention residuals, short
     // convolutions and NVFP4 / MXFP8 experts in the source.
     if let Some(dir) = Some(Path::new(model)).filter(|d| {

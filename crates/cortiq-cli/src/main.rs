@@ -19,6 +19,7 @@ mod flint;
 mod hotmix;
 mod edge0;
 mod flint_hybrid;
+mod gigaampack;
 mod gguf;
 mod gguf_iq;
 mod gguf_qwen4;
@@ -747,13 +748,14 @@ enum Commands {
         #[arg(long)]
         interleave: bool,
     },
-    /// Transcribe audio with a Whisper or Nemotron 3.5 Transcribe CMF
-    /// checkpoint (WAV, PCM or float).
+    /// Transcribe audio with a Whisper, Nemotron 3.5 Transcribe or GigaAM
+    /// CMF checkpoint (WAV, PCM or float; GigaAM reads other containers
+    /// through ffmpeg).
     Transcribe {
-        /// Path to a Whisper or Nemotron 3.5 Transcribe .cmf model
+        /// Path to a Whisper, Nemotron 3.5 Transcribe or GigaAM .cmf model
         model: String,
-        /// Input WAV audio (Nemotron: several files are transcribed in one
-        /// load, one `<file>: <text>` line each)
+        /// Input audio (Nemotron, GigaAM: several files are transcribed in
+        /// one load, one `<file>: <text>` line each)
         #[arg(required = true, num_args = 1..)]
         audio: Vec<String>,
         /// Whisper language code, e.g. en, ru, de (default: en)
@@ -773,10 +775,21 @@ enum Commands {
         /// Nemotron: print timings and token counts to stderr
         #[arg(long)]
         stats: bool,
-        /// Nemotron: also print every word's start and end (seconds) and,
-        /// in a speaker-tagged transcript, its speaker
+        /// Nemotron, GigaAM: also print every word's start and end (seconds)
+        /// and, in a speaker-tagged transcript, its speaker
         #[arg(long)]
         timestamps: bool,
+        /// GigaAM: which transcript — e2e (case, punctuation, digits; the
+        /// default), raw (lower-case words) or both
+        #[arg(long, default_value = "e2e")]
+        head: String,
+        /// GigaAM: one JSON object a file (text, segments, word times, timings)
+        #[arg(long)]
+        json: bool,
+        /// GigaAM: cut by voice activity even when the clip fits one
+        /// 30-second segment (a longer recording is always cut)
+        #[arg(long)]
+        vad: bool,
     },
     /// Package a Gradium Phonon Q8 checkpoint as a self-contained CMF file.
     #[cfg(feature = "phonon")]
@@ -5108,8 +5121,14 @@ async fn main() -> anyhow::Result<()> {
             prompt,
             stats,
             timestamps,
+            head,
+            json,
+            vad,
         } => {
             let model = Arc::new(CmfModel::open(&model)?);
+            if cortiq_engine::gigaam::is_gigaam(&model) {
+                return transcribe::run_gigaam(&model, &audio, &head, stats, timestamps, json, vad);
+            }
             if model.header.arch.arch_name == cortiq_engine::nemotron_asr::ARCH_NAME {
                 return transcribe::run_nemotron(
                     &model,
@@ -8688,6 +8707,15 @@ async fn cmd_serve(
             .next()
             .ok_or_else(|| anyhow::anyhow!("bind address {host}:{port}: no address"))?;
         return cortiq_server::embeddings::serve(model, model_path, addr).await;
+    }
+    // A GigaAM file is a speech recognizer: the transcription server
+    // (POST /v1/audio/transcriptions) takes it.
+    if cortiq_engine::gigaam::is_gigaam(&model) {
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .map_err(|e| anyhow::anyhow!("bind address {host}:{port}: {e}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("bind address {host}:{port}: no address"))?;
+        return cortiq_server::transcriptions::serve(model, model_path, addr).await;
     }
     let lookup_mode =
         cortiq_engine::lookup::LookupMode::resolve(lookup_mode).map_err(anyhow::Error::msg)?;

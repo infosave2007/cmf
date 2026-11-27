@@ -13,6 +13,7 @@ pub mod openai;
 pub mod route;
 pub mod streaming;
 pub mod tool_calls;
+pub mod transcriptions;
 
 pub use route::SkillRouter;
 

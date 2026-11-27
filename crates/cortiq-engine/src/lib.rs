@@ -28,6 +28,7 @@ pub mod nvg_train;
 pub mod nvg_dev;
 pub mod f32_backend;
 pub mod g3n;
+pub mod gigaam;
 pub mod g4e;
 pub mod gptq_capture;
 pub mod glm5_next;
