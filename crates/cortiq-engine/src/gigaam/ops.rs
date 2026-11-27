@@ -282,11 +282,44 @@ pub(super) fn sumsq(x: &[f32]) -> f32 {
 
 #[inline(always)]
 fn dot_rows_body(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize) {
-    // every weight row against every input row: sixteen lanes a dot, so the
-    // reduction vectorizes without reassociation flags
+    // Every weight row against the input rows four at a time: the weight
+    // chunk is loaded once and feeds four independent sums of eight lanes,
+    // so neither the reduction order nor one sum's latency holds the loop.
     for r in 0..rows {
         let wr = &w[r * cols..(r + 1) * cols];
-        for i in 0..n {
+        let mut i = 0;
+        while i + 4 <= n {
+            let (x0, x1, x2, x3) = (&x[i * cols..][..cols], &x[(i + 1) * cols..][..cols], &x[(i + 2) * cols..][..cols], &x[(i + 3) * cols..][..cols]);
+            let mut acc = [[0.0f32; 8]; 4];
+            let mut c = 0;
+            while c + 8 <= cols {
+                for l in 0..8 {
+                    let wv = wr[c + l];
+                    acc[0][l] += wv * x0[c + l];
+                    acc[1][l] += wv * x1[c + l];
+                    acc[2][l] += wv * x2[c + l];
+                    acc[3][l] += wv * x3[c + l];
+                }
+                c += 8;
+            }
+            let mut s = [0.0f32; 4];
+            for (s, a) in s.iter_mut().zip(&acc) {
+                *s = a.iter().sum();
+            }
+            while c < cols {
+                let wv = wr[c];
+                s[0] += wv * x0[c];
+                s[1] += wv * x1[c];
+                s[2] += wv * x2[c];
+                s[3] += wv * x3[c];
+                c += 1;
+            }
+            for (k, v) in s.iter().enumerate() {
+                y[(i + k) * rows + r] = *v;
+            }
+            i += 4;
+        }
+        while i < n {
             let xi = &x[i * cols..(i + 1) * cols];
             let (mut a0, mut a1) = ([0.0f32; 8], [0.0f32; 8]);
             let mut wc = wr.chunks_exact(16);
@@ -305,6 +338,7 @@ fn dot_rows_body(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], row
                 s += wv * xv;
             }
             y[i * rows + r] = s;
+            i += 1;
         }
     }
 }
@@ -314,6 +348,23 @@ simd_fn!(
     /// the weight for so few rows).
     dot_rows, dot_rows_body, (w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize)
 );
+
+/// [`dot_rows`] with the weight rows spread over the pool (the output is
+/// written a column range a worker).
+pub(super) fn dot_rows_par(w: &[f32], rows: usize, cols: usize, x: &[f32], n: usize, y: &mut [f32], pool: Option<&Pool>) {
+    if pool.is_none() || rows * cols * n < 1 << 17 {
+        return dot_rows(w, cols, x, n, y, rows);
+    }
+    let yp = Shared(y.as_mut_ptr());
+    par(pool, rows, 64, &|r0, r1| {
+        let mut part = vec![0f32; n * (r1 - r0)];
+        dot_rows(&w[r0 * cols..r1 * cols], cols, x, n, &mut part, r1 - r0);
+        for i in 0..n {
+            // SAFETY: columns r0..r1 of every row belong to this range alone.
+            unsafe { yp.slice(i * rows + r0, r1 - r0) }.copy_from_slice(&part[i * (r1 - r0)..(i + 1) * (r1 - r0)]);
+        }
+    });
+}
 
 /// Input rows up to which a float product goes through [`dot_rows`] where
 /// the GEMM is not Accelerate's.
@@ -425,7 +476,7 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
         if cfg!(target_os = "macos") {
             gemm(d, 0, rows);
         } else if n <= SMALL_BATCH {
-            dot_rows(d, cols, x, n, y, rows);
+            dot_rows_par(d, rows, cols, x, n, y, pool);
         } else if by_batch {
             chunked(d, 0, rows);
         } else {
@@ -743,7 +794,7 @@ mod tests {
 
     #[test]
     fn dot_rows_matches_the_float_product() {
-        let (rows, cols, n) = (9usize, 37usize, 3usize);
+        let (rows, cols, n) = (9usize, 37usize, 7usize);
         let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.13).collect();
         let x: Vec<f32> = (0..n * cols).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.3).collect();
         let mut y = vec![0f32; n * rows];

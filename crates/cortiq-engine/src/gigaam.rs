@@ -1314,11 +1314,14 @@ impl Transcriber {
                 }
             }
             let results: Vec<std::sync::Mutex<Option<decode::Decoded>>> = jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
-            ops::par(pool, jobs.len(), 2, &|a, b| {
+            // many jobs: one a worker; a few: one after another, the workers inside each job's products
+            let workers = pool.map_or(1, |p| p.n_workers() + 1);
+            let spread = jobs.len() * 2 >= workers;
+            ops::par(if spread { pool } else { None }, jobs.len(), 2, &|a, b| {
                 for q in a..b {
                     let (k, _, head) = jobs[q];
                     let rows = &enc[starts[k] * w..(starts[k] + segs[k]) * w];
-                    *results[q].lock().unwrap() = Some(head.decode(rows, segs[k], w));
+                    *results[q].lock().unwrap() = Some(head.decode(rows, segs[k], w, if spread { None } else { pool }));
                 }
             });
             for (q, (k, which, head)) in jobs.iter().enumerate() {
@@ -1383,12 +1386,47 @@ impl Transcriber {
 
 /// Mono 16 kHz samples of an audio file: WAV here, other containers through `ffmpeg`.
 pub fn read_audio(path: &std::path::Path) -> Result<Vec<f32>, String> {
-    crate::egemma2_audio::read_audio(path)
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    decode_audio(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Mono 16 kHz samples of an audio file's bytes.
 pub fn decode_audio(bytes: &[u8]) -> Result<Vec<f32>, String> {
-    crate::egemma2_audio::decode_audio(bytes)
+    match pcm16_mono_16k(bytes) {
+        Some(samples) => Ok(samples),
+        None => crate::egemma2_audio::decode_audio(bytes),
+    }
+}
+
+/// The samples of a plain 16-bit PCM, mono, 16 kHz WAV — the format the
+/// model takes as it is, read without the general decoder's passes.
+fn pcm16_mono_16k(b: &[u8]) -> Option<Vec<f32>> {
+    if b.len() < 44 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut plain = false;
+    let mut i = 12;
+    while i + 8 <= b.len() {
+        let len = u32::from_le_bytes(b[i + 4..i + 8].try_into().ok()?) as usize;
+        let st = i + 8;
+        match &b[i..i + 4] {
+            b"fmt " if st + 16 <= b.len() => {
+                let u16_at = |o: usize| u16::from_le_bytes([b[st + o], b[st + o + 1]]);
+                let rate = u32::from_le_bytes(b[st + 4..st + 8].try_into().ok()?);
+                plain = u16_at(0) == 1 && u16_at(2) == 1 && rate as usize == SR && u16_at(14) == 16;
+            }
+            b"data" => {
+                if !plain {
+                    return None;
+                }
+                let end = st.saturating_add(len).min(b.len());
+                return Some(b[st..end].chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0).collect());
+            }
+            _ => {}
+        }
+        i = st.saturating_add(len).saturating_add(len & 1);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1410,6 +1448,32 @@ mod tests {
             let (a, b) = (x[2 * i].hypot(x[2 * i + 1]), y[2 * i].hypot(y[2 * i + 1]));
             assert!((a - b).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn plain_wav_is_read_directly() {
+        let mut wav = Vec::new();
+        let data: Vec<u8> = [0i16, 16384, -32768, 32767].iter().flat_map(|v| v.to_le_bytes()).collect();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        for v in [1u16, 1] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&32000u32.to_le_bytes());
+        for v in [2u16, 16] {
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&data);
+        assert_eq!(pcm16_mono_16k(&wav).unwrap(), vec![0.0, 0.5, -1.0, 32767.0 / 32768.0]);
+        // another rate goes to the general decoder
+        wav[24..28].copy_from_slice(&8000u32.to_le_bytes());
+        assert!(pcm16_mono_16k(&wav).is_none());
+        assert!(pcm16_mono_16k(b"not a wav").is_none());
     }
 
     #[test]

@@ -159,10 +159,10 @@ impl Head {
 
     /// Greedy decoding of one segment: `enc` is `[t, width]` encoder rows.
     /// Runs on the calling thread (segments and heads are spread by the caller).
-    pub(crate) fn decode(&self, enc: &[f32], t: usize, width: usize) -> Decoded {
+    pub(crate) fn decode(&self, enc: &[f32], t: usize, width: usize, pool: Option<&crate::pool::Pool>) -> Decoded {
         debug_assert_eq!(enc.len(), t * width);
-        // the caller's threads are busy with other segments: no pool, no device
-        let ex = super::Exec { gpu: false, ..super::Exec::new(None) };
+        // `pool`: None when the caller's threads are busy with other segments
+        let ex = super::Exec { gpu: false, ..super::Exec::new(pool) };
         match &self.kind {
             Kind::Ctc(lin) => {
                 let logits = lin.apply(enc, t, &ex);
@@ -178,7 +178,7 @@ impl Head {
                 }
                 out
             }
-            Kind::Rnnt(r) => r.greedy(&r.enc.apply(enc, t, &ex), t, self.blank),
+            Kind::Rnnt(r) => r.greedy(&r.enc.apply(enc, t, &ex), t, self.blank, pool),
         }
     }
 
@@ -234,15 +234,15 @@ fn argmax(x: &[f32]) -> u32 {
 
 impl Rnnt {
     /// One LSTM step: `(h, c) ← cell(x, h, c)`; `x` empty stands for zeros.
-    fn step(&self, x: &[f32], h: &mut [f32], c: &mut [f32], gates: &mut [f32]) {
+    fn step(&self, x: &[f32], h: &mut [f32], c: &mut [f32], gates: &mut [f32], pool: Option<&crate::pool::Pool>) {
         let n = self.hidden;
         gates.copy_from_slice(&self.bias);
         let mut acc = vec![0f32; 4 * n];
         if !x.is_empty() {
-            ops::matmul(&ops::Weight::Dense(&self.w_ih), 4 * n, n, x, 1, &mut acc, None);
+            ops::matmul(&ops::Weight::Dense(&self.w_ih), 4 * n, n, x, 1, &mut acc, pool);
             ops::axpy(gates, 1.0, &acc);
         }
-        ops::matmul(&ops::Weight::Dense(&self.w_hh), 4 * n, n, h, 1, &mut acc, None);
+        ops::matmul(&ops::Weight::Dense(&self.w_hh), 4 * n, n, h, 1, &mut acc, pool);
         ops::axpy(gates, 1.0, &acc);
         for i in 0..n {
             let (ig, fg, gg, og) = (sigmoid(gates[i]), sigmoid(gates[n + i]), gates[2 * n + i].tanh(), sigmoid(gates[3 * n + i]));
@@ -255,7 +255,7 @@ impl Rnnt {
     /// emit units until the joint says blank (at most `max_symbols`), then
     /// move on. The joint is evaluated for a run of frames at once — the
     /// prediction does not change until a unit is emitted.
-    fn greedy(&self, enc: &[f32], t: usize, blank: u32) -> Decoded {
+    fn greedy(&self, enc: &[f32], t: usize, blank: u32, pool: Option<&crate::pool::Pool>) -> Decoded {
         const WINDOW: usize = 8;
         let (n, j) = (self.hidden, self.joint);
         let mut out = Decoded::default();
@@ -275,8 +275,8 @@ impl Rnnt {
                 ph.copy_from_slice(&h);
                 pc.copy_from_slice(&c);
                 match last {
-                    None => self.step(&[], &mut ph, &mut pc, &mut gates),
-                    Some(id) => self.step(&self.embed[id as usize * n..(id as usize + 1) * n], &mut ph, &mut pc, &mut gates),
+                    None => self.step(&[], &mut ph, &mut pc, &mut gates, pool),
+                    Some(id) => self.step(&self.embed[id as usize * n..(id as usize + 1) * n], &mut ph, &mut pc, &mut gates, pool),
                 }
                 ops::matmul(&ops::Weight::Dense(&self.pred_w), j, n, &ph, 1, &mut pred, None);
                 ops::axpy(&mut pred, 1.0, &self.pred_b);
@@ -289,7 +289,7 @@ impl Rnnt {
                     *d = (a + b).max(0.0);
                 }
             }
-            ops::matmul(&ops::Weight::Dense(&self.out_w), self.classes, j, &hid[..count * j], count, &mut logits[..count * self.classes], None);
+            ops::matmul(&ops::Weight::Dense(&self.out_w), self.classes, j, &hid[..count * j], count, &mut logits[..count * self.classes], pool);
             let mut emitted = None;
             for w in 0..count {
                 let row = &mut logits[w * self.classes..(w + 1) * self.classes];
@@ -409,7 +409,7 @@ mod tests {
         // frames: a a blank a blank blank a a
         let seq = [0, 0, 1, 0, 1, 1, 0, 0];
         let enc: Vec<f32> = seq.iter().flat_map(|&c| if c == 0 { [1.0f32, 0.0] } else { [0.0, 1.0] }).collect();
-        let d = head.decode(&enc, seq.len(), 2);
+        let d = head.decode(&enc, seq.len(), 2, None);
         assert_eq!(d.ids, vec![0, 0, 0]);
         assert_eq!(d.frames, vec![0, 3, 6]);
         assert_eq!(head.text(&d.ids), "aaa");
