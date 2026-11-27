@@ -576,10 +576,13 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
         sgemm_public(n, r1 - r0, cols, 1.0, x, cols, block, cols, true, out, rows);
     };
     // Off macOS one GEMM is one thread. A long batch is cut into chunks of
-    // rows, one a worker, against the same tile; a short one leaves the
-    // tiles to the workers instead.
+    // rows, one a worker, against the same tile; a shorter one leaves the
+    // tiles to the workers instead (a GEMM packs its whole weight block
+    // whatever the batch: a chunk of five rows would pay that for nothing).
     let workers = pool.map_or(1, |p| p.n_workers() + 1);
-    let by_batch = n >= 4 * workers;
+    let by_batch = n >= 48 * workers;
+    // tiles for the workers: cache-sized, and at least one a worker
+    let tile_rows = (TILE_FLOATS / cols).min(rows.div_ceil(workers)).clamp(8, rows.max(8));
     let chunked = |block: &[f32], r0: usize, r1: usize| {
         let per = n.div_ceil(workers).max(4);
         par(pool, n.div_ceil(per), 1, &|a, b| {
@@ -599,7 +602,7 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
         } else if by_batch {
             chunked(d, 0, rows);
         } else {
-            let step = (TILE_FLOATS / cols).clamp(8, rows.max(8));
+            let step = tile_rows;
             par(pool, rows.div_ceil(step), 1, &|a, b| {
                 for t in a..b {
                     let (r0, r1) = (t * step, ((t + 1) * step).min(rows));
@@ -633,7 +636,7 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
             r0 = r1;
         }
     } else {
-        let step = (TILE_FLOATS / cols).clamp(8, rows.max(8));
+        let step = tile_rows;
         par(pool, rows.div_ceil(step), 1, &|a, b| {
             let mut tile = vec![0f32; step * cols];
             for t in a..b {

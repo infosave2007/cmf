@@ -13,7 +13,7 @@ import json, math, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "dory"))
 import card_figures as cf  # scripts/dory: the SVG writer every card figure shares
-from card_figures import Svg, INK, INK2, LINE, BLUE, ORANGE, AQUA, GREY, TINT, head
+from card_figures import Svg, INK, INK2, LINE, BLUE, ORANGE, TINT, head
 
 L4 = {"en": "NVIDIA L4 (24 GB), Google Colab, 12 vCPU", "ru": "NVIDIA L4 (24 ГБ), Google Colab, 12 vCPU", "zh": "NVIDIA L4（24 GB），Google Colab，12 vCPU"}
 STAND = {
@@ -24,29 +24,28 @@ STAND = {
     "cpu_m4": {"en": "MacBook Air M4 (24 GB), fanless, CPU only", "ru": "MacBook Air M4 (24 ГБ), без вентилятора, только CPU", "zh": "MacBook Air M4（24 GB），无风扇，仅 CPU"},
 }
 BACKEND = {"cuda": "CUDA", "vulkan": "Vulkan", "metal": "Metal", "cpu": "CPU", "cpu_m4": "CPU"}
-# file tag -> (label, colour, stroke); the headline file last so it is drawn on top
+# file tag -> (label, colour, stroke); the headline file last so it is drawn on top. The four-bit files run at
+# the eight-bit files' speed (the device holds float planes of either), so the figures keep to the default pair.
 FILES = [
-    ("ctc-q4tp", "CTC q4tp", GREY, 3),
-    ("rnnt-q4tp", "RNN-T q4tp", AQUA, 3),
-    ("ctc-q8_2f", "CTC q8_2f", ORANGE, 3),
-    ("rnnt-q8_2f", "RNN-T q8_2f", BLUE, 5),
+    ("ctc-q8_2f", "CTC", ORANGE, 3),
+    ("rnnt-q8_2f", "RNN-T", BLUE, 5),
 ]
 T = {
     "en": {
         "title": "Speed against the recording's length",
-        "sub": "GigaAM-v4, cortiq transcribe, second pass in one process; recordings over 30 s are cut by voice activity.",
+        "sub": "GigaAM-v4 q8_2f, cortiq transcribe, second pass in one process; recordings over 30 s are cut by voice activity.",
         "time": "Time to the transcript, s", "x": "Seconds of audio a second", "vram": "Peak card memory, GB", "rss": "Peak process memory, GB",
         "len": "recording", "stand": "Stand", "s": "s", "min": "min", "h": "h",
     },
     "ru": {
         "title": "Скорость в зависимости от длины записи",
-        "sub": "GigaAM-v4, cortiq transcribe, второй проход в одном процессе; записи длиннее 30 с режутся по голосовой активности.",
+        "sub": "GigaAM-v4 q8_2f, cortiq transcribe, второй проход в одном процессе; записи длиннее 30 с режутся по голосовой активности.",
         "time": "Время до транскрипта, с", "x": "Секунд аудио в секунду", "vram": "Пик памяти карты, ГБ", "rss": "Пик памяти процесса, ГБ",
         "len": "запись", "stand": "Стенд", "s": "с", "min": "мин", "h": "ч",
     },
     "zh": {
         "title": "速度随录音长度的变化",
-        "sub": "GigaAM-v4，cortiq transcribe，同一进程内的第二遍；超过 30 秒的录音按语音活动切分。",
+        "sub": "GigaAM-v4 q8_2f，cortiq transcribe，同一进程内的第二遍；超过 30 秒的录音按语音活动切分。",
         "time": "出稿时间，秒", "x": "每秒处理的音频秒数", "vram": "显存峰值，GB", "rss": "进程内存峰值，GB",
         "len": "录音", "stand": "测试平台", "s": "秒", "min": "分", "h": "时",
     },

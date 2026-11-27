@@ -3,7 +3,7 @@
 
     bench_rows.py LOG [LOG ...] > figures_data.json
 
-A line: `TAG backend sSECONDS: cold X warm Y | vad As  features Bs  encoder Cs  decode Ds | Nx real time |
+A line (a Mac's CPU log is renamed `cpu` → `cpu_m4` before it comes here): `TAG backend sSECONDS: cold X warm Y | vad As  features Bs  encoder Cs  decode Ds | Nx real time |
 vram_peak M MiB | rss_peak R MiB`. Output: {backend: {TAG: [{"secs", "time" (warm, s), "cold", "x" (seconds of
 audio a second), "vad", "features", "encoder", "decode", "vram_gb", "rss_gb"}]}}; memory is MiB / 1024. A
 backend measured twice keeps the later line.
@@ -11,7 +11,7 @@ backend measured twice keeps the later line.
 import json, re, sys
 
 pat = re.compile(
-    r"\s*(\S+) (cuda|vulkan|metal|cpu) s(\d+): cold ([\d.]+) warm ([\d.]+) \| vad ([\d.]+)s\s+features ([\d.]+)s\s+"
+    r"\s*(\S+) (cuda|vulkan|metal|cpu_m4|cpu) s(\d+): cold ([\d.]+) warm ([\d.]+) \| vad ([\d.]+)s\s+features ([\d.]+)s\s+"
     r"encoder ([\d.]+)s\s+decode ([\d.]+)s\s*\| ([\d.]+)x real time \| vram_peak (\d+) MiB \| rss_peak (\d+) MiB"
 )
 data = {}
