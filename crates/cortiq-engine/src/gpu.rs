@@ -5564,6 +5564,111 @@ pub fn vit_encode(a: &VitArgs, x: &mut [f32]) -> bool {
     }
 }
 
+/// A weight of the GigaAM encoder as floats, for a device that keeps its
+/// own copy: asked once a weight, when the device cache misses.
+pub trait GaWeight: Sync {
+    /// Fill `dst` (`[rows·cols]`, row-major) with the weight.
+    fn fill(&self, dst: &mut [f32]);
+}
+
+/// One product of the GigaAM encoder for [`gigaam_encode`]:
+/// `y[n, rows] = x[n, cols]·Wᵀ + bias`.
+pub struct GaLin<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    pub weight: &'a dyn GaWeight,
+    /// `[rows]`, or empty: no bias
+    pub bias: &'a [f32],
+}
+
+/// A layer's convolution module: `inp` gives `[n, 2·dim]` (the stream, then
+/// its gate); the stream goes through a depthwise convolution over time
+/// (`taps` is `[kernel][dim]`, `(kernel − 1) / 2` zero frames on both sides,
+/// `bias` `[dim]`) and gets the segment's mean times `mean_w` added; then
+/// `out(silu((conv + mean)·σ(gate)))`.
+pub struct GaConv<'a> {
+    pub inp: GaLin<'a>,
+    pub taps: &'a [f32],
+    pub bias: &'a [f32],
+    pub kernel: usize,
+    pub mean_w: &'a [f32],
+    pub out: GaLin<'a>,
+}
+
+/// One Zapformer layer over a stream `h` (`[n, dim]`), `r = h` kept aside:
+/// `s = h + ff1_out(silu(ff1_in(h)))`;
+/// `[q, k] = qk(rms(r, in_norm))`, `[v, gate_in, gate_out] = vg(s)`, each a
+/// third or a half of the row, `heads` heads of `head_dim`; q and k rotated
+/// by the frame's angles in neighbour pairs, `v ← v·σ(gate_in)`;
+/// `s += attn_out(softmax(q·kᵀ/√head_dim)·v ⊙ σ(gate_out))` over the whole
+/// segment; `s += conv(s)` and `s += ff2(s)` where present;
+/// `h = rms(r + ¼·(s − r), norm)`, where
+/// `rms(x, w) = x·rsqrt(mean(x²) + 1e-6)·w` a row.
+pub struct GaLayer<'a> {
+    pub ff1_in: GaLin<'a>,
+    pub ff1_out: GaLin<'a>,
+    pub in_norm: &'a [f32],
+    pub qk: GaLin<'a>,
+    pub vg: GaLin<'a>,
+    pub attn_out: GaLin<'a>,
+    pub conv: Option<GaConv<'a>>,
+    pub ff2: Option<(GaLin<'a>, GaLin<'a>)>,
+    pub norm: &'a [f32],
+}
+
+/// One stack: with `fold` 2 its rows are pairs of frames (`[⌈t/2⌉, 2·width]`,
+/// an odd last frame paired with zeros), and the pairs are split back after
+/// it. `h = proj(x)`, `bypass = residual_scales[0]·h`, `h ← input_scale·h`,
+/// after layer i `bypass += residual_scales[i + 1]·h`, and the stack gives
+/// `x + proj_t(bypass)`.
+pub struct GaStack<'a> {
+    pub fold: usize,
+    pub dim: usize,
+    pub heads: usize,
+    pub proj: GaLin<'a>,
+    pub proj_t: GaLin<'a>,
+    pub residual_scales: &'a [f32],
+    pub input_scale: f32,
+    pub layers: Vec<GaLayer<'a>>,
+}
+
+/// The GigaAM encoder for [`gigaam_encode`]. `cos` / `sin` are
+/// `[position][head_dim / 2]`; after the last stack every row is scaled by
+/// `out_scale / √(mean(x²) + out_eps²)`. `key` names the model for the
+/// device's weight cache.
+pub struct GigaamArgs<'a> {
+    pub key: u64,
+    pub width: usize,
+    pub head_dim: usize,
+    pub stacks: Vec<GaStack<'a>>,
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub out_scale: f32,
+    pub out_eps: f32,
+    pub prof: bool,
+}
+
+/// The GigaAM encoder stacks over one segment `x` (`[t, width]`) in place,
+/// the activations on the device from the first stack to the output norm:
+/// one upload, one readback. `false` = declined; the caller runs its own
+/// path. `CMF_GIGAAM_RESIDENT=0` declines.
+#[allow(unused_variables)]
+pub fn gigaam_encode(a: &GigaamArgs, x: &mut [f32], t: usize) -> bool {
+    if std::env::var("CMF_GIGAAM_RESIDENT").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::gigaam::encode(a, x, t),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gigaam::encode(a, x, t),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::gigaam_encode(a, x, t),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// One SAM block for [`sam_encode`]. `rel` is `[2w−1, hd]` relative positions,
 /// h then w (window blocks; the global ones take `SamArgs::rel_global`).
 pub struct SamLayer<'a> {

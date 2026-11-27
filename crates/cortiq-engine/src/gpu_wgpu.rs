@@ -87,6 +87,7 @@ pub(crate) mod mhc;
 pub(crate) mod vres;
 pub mod dflash_dev;
 pub(crate) mod vit;
+pub(crate) mod gigaam;
 pub(crate) mod dory;
 /// Inkling-2-Mini's resident stack.
 pub(crate) mod inkling;

@@ -90,9 +90,12 @@ with open(a.out, "w", encoding="utf-8") as out:
             row = {name: v.text for name, v in r.items()}
             row["segments"] = [[s.start, s.end] for s in r["e2e"].segments]
         else:
-            r = model.transcribe(path, word_timestamps=a.words)
+            try:
+                r = model.transcribe(path, word_timestamps=a.words)
+            except ValueError:  # over 30 s: the package's own long-form path
+                r = model.transcribe_longform(path)
             row = {name: v.text for name, v in r.items()}
-            if a.words:
+            if a.words and hasattr(r["e2e"], "words") and not hasattr(r["e2e"], "segments"):
                 row["words"] = {name: [[w.text, round(w.start, 3), round(w.end, 3)] for w in v.words] for name, v in r.items()}
         dt = time.time() - t1
         total_audio += secs

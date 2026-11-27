@@ -150,6 +150,11 @@ impl Lin {
             .as_ref()
     }
 
+    /// This product for a device that keeps the weight itself.
+    fn ga(&self) -> crate::gpu::GaLin<'_> {
+        crate::gpu::GaLin { rows: self.rows, cols: self.cols, weight: self, bias: &self.bias }
+    }
+
     /// `y[n, rows] = x[n, cols]·Wᵀ + b`.
     fn apply(&self, x: &[f32], n: usize, ex: &Exec) -> Vec<f32> {
         debug_assert_eq!(x.len(), n * self.cols);
@@ -187,6 +192,34 @@ impl Lin {
     }
 }
 
+impl crate::gpu::GaWeight for Lin {
+    fn fill(&self, dst: &mut [f32]) {
+        let (rows, cols) = (self.rows, self.cols);
+        debug_assert_eq!(dst.len(), rows * cols);
+        match &self.host {
+            HostW::Dense(d) => dst.copy_from_slice(d),
+            HostW::Q8 { row_scale, col_field } => {
+                let codes = &self.model.entry_bytes(&self.model.tensors[self.idx])[..rows * cols];
+                for (r, row) in dst.chunks_exact_mut(cols).enumerate() {
+                    ops::widen_i8(row, &codes[r * cols..(r + 1) * cols]);
+                    let rs = row_scale[r];
+                    if col_field.is_empty() {
+                        row.iter_mut().for_each(|v| *v *= rs);
+                    } else {
+                        row.iter_mut().zip(col_field).for_each(|(v, &c)| *v *= rs * c);
+                    }
+                }
+            }
+            HostW::Rows => {
+                let q = self.qtensor().expect("checked at load");
+                for (r, row) in dst.chunks_exact_mut(cols).enumerate() {
+                    q.row_f32(r, row);
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // execution context and timers
 // ---------------------------------------------------------------------
@@ -209,6 +242,8 @@ pub(crate) struct Exec<'a> {
     pub gpu: bool,
     /// a product smaller than this many multiply-adds stays on the host
     pub gpu_min_macs: usize,
+    /// try the whole encoder on the device before the per-product path
+    pub resident: bool,
     prof: bool,
     times: [std::sync::atomic::AtomicU64; SLOTS],
 }
@@ -221,6 +256,7 @@ impl<'a> Exec<'a> {
             pool,
             gpu,
             gpu_min_macs,
+            resident: gpu && std::env::var("CMF_GIGAAM_RESIDENT").as_deref() != Ok("0"),
             prof: std::env::var("CMF_GIGAAM_PROF").is_ok_and(|v| v == "1"),
             times: Default::default(),
         }
@@ -444,6 +480,8 @@ struct Attn {
 struct ConvMod {
     inp: Lin,
     dw_w: Vec<f32>,
+    /// the same taps as `[kernel][channel]`
+    taps: Vec<f32>,
     dw_b: Vec<f32>,
     kernel: usize,
     mean_w: Vec<f32>,
@@ -670,9 +708,18 @@ impl Rope {
 
 impl ConvMod {
     fn load(m: &Arc<CmfModel>, p: &str, kernel: usize) -> Result<Self, String> {
+        let dw_w = tensor_f32(m, &format!("{p}.depthwise_conv.weight"))?;
+        let d = dw_w.len() / kernel.max(1);
+        let mut taps = vec![0f32; dw_w.len()];
+        for c in 0..d {
+            for j in 0..kernel {
+                taps[j * d + c] = dw_w[c * kernel + j];
+            }
+        }
         Ok(Self {
             inp: Lin::load(m, &format!("{p}.in_proj"))?,
-            dw_w: tensor_f32(m, &format!("{p}.depthwise_conv.weight"))?,
+            dw_w,
+            taps,
             dw_b: tensor_f32(m, &format!("{p}.depthwise_conv.bias"))?,
             kernel,
             mean_w: tensor_f32(m, &format!("{p}.weighted_mean.weights"))?,
@@ -780,6 +827,10 @@ struct Encoder {
     out_scale: f32,
     out_eps: f32,
     width: usize,
+    /// the model's key in a device weight cache
+    key: u64,
+    /// the device declined the whole-encoder path: do not ask again
+    resident_off: std::sync::atomic::AtomicBool,
 }
 
 impl Encoder {
@@ -849,12 +900,71 @@ impl Encoder {
             out_scale: scalar(m, &format!("{ENC}.out_norm.scale"))?,
             out_eps: scalar(m, &format!("{ENC}.out_norm.eps"))?,
             width,
+            key: m.uid(),
+            resident_off: Default::default(),
         })
+    }
+
+    /// The stacks as the device's whole-encoder path takes them.
+    fn ga_args(&self, prof: bool) -> crate::gpu::GigaamArgs<'_> {
+        use crate::gpu::{GaConv, GaLayer, GaStack, GigaamArgs};
+        let stacks = self
+            .stacks
+            .iter()
+            .map(|st| GaStack {
+                fold: st.ds,
+                dim: st.dim,
+                heads: st.layers.first().map_or(1, |l| l.attn.heads),
+                proj: st.proj.ga(),
+                proj_t: st.proj_t.ga(),
+                residual_scales: &st.residual_scales,
+                input_scale: st.input_scale,
+                layers: st
+                    .layers
+                    .iter()
+                    .map(|l| GaLayer {
+                        ff1_in: l.ff1.inp.ga(),
+                        ff1_out: l.ff1.out.ga(),
+                        in_norm: &l.attn.in_norm,
+                        qk: l.attn.qk.ga(),
+                        vg: l.attn.vg.ga(),
+                        attn_out: l.attn.out.ga(),
+                        conv: l.conv.as_ref().map(|c| GaConv { inp: c.inp.ga(), taps: &c.taps, bias: &c.dw_b, kernel: c.kernel, mean_w: &c.mean_w, out: c.out.ga() }),
+                        ff2: l.ff2.as_ref().map(|f| (f.inp.ga(), f.out.ga())),
+                        norm: &l.norm,
+                    })
+                    .collect(),
+            })
+            .collect();
+        GigaamArgs { key: self.key, width: self.width, head_dim: QDIM, stacks, cos: &self.rope.cos, sin: &self.rope.sin, out_scale: self.out_scale, out_eps: self.out_eps, prof }
+    }
+
+    /// The whole encoder on the device, a segment at a time; `None` when it declines.
+    fn forward_resident(&self, x: &[f32], segs: &[usize], ex: &Exec) -> Option<Vec<f32>> {
+        use std::sync::atomic::Ordering;
+        if !ex.resident || self.resident_off.load(Ordering::Relaxed) {
+            return None;
+        }
+        let args = self.ga_args(ex.prof);
+        let w = self.width;
+        let mut out = x.to_vec();
+        let mut row0 = 0;
+        for &t in segs {
+            if !crate::gpu::gigaam_encode(&args, &mut out[row0 * w..(row0 + t) * w], t) {
+                self.resident_off.store(true, Ordering::Relaxed);
+                return None;
+            }
+            row0 += t;
+        }
+        Some(out)
     }
 
     /// `[Σ segs, width]` front-end rows to encoder output rows.
     fn forward(&self, mut x: Vec<f32>, segs: &[usize], ex: &Exec) -> Vec<f32> {
         let w = self.width;
+        if let Some(out) = self.forward_resident(&x, segs, ex) {
+            return out;
+        }
         for stack in &self.stacks {
             if stack.ds == 1 {
                 x = stack.forward(&x, segs, &self.rope, ex);

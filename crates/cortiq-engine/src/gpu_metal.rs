@@ -37,6 +37,7 @@ pub(crate) mod h3;
 pub mod egemma2;
 // The vision towers of the OCR models resident on the device.
 pub mod vit;
+pub mod gigaam;
 // Unlimited-OCR's block-sparse attention on the graphs.
 pub mod uocr;
 // Dory's looped stack.
