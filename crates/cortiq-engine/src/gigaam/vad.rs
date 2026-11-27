@@ -75,6 +75,8 @@ struct VadLayer {
     norm_conv: Norm,
     pw1: Lin,
     dw_w: Vec<f32>,
+    /// the same taps as `[kernel][channel]`
+    taps: Vec<f32>,
     dw_b: Vec<f32>,
     conv_norm: Norm,
     pw2: Lin,
@@ -98,6 +100,10 @@ pub struct Vad {
     /// rotary angles: `[step][head_dim / 2]`
     cos: Vec<f32>,
     sin: Vec<f32>,
+    /// the model's key in a device weight cache
+    key: u64,
+    /// the device declined the model: the host runs it
+    dev_off: std::sync::atomic::AtomicBool,
 }
 
 impl Vad {
@@ -135,6 +141,13 @@ impl Vad {
         for l in 0..n_layers {
             let p = format!("vad.encoder.layers.{l}");
             let lin = |s: &str| Lin::load(m, &format!("{p}.{s}"));
+            let dw_w = tensor_f32(m, &format!("{p}.conv.depthwise_conv.weight"))?;
+            let mut taps = vec![0f32; dw_w.len()];
+            for c in 0..dw_w.len() / kernel.max(1) {
+                for j in 0..kernel {
+                    taps[j * dim + c] = dw_w[c * kernel + j];
+                }
+            }
             layers.push(VadLayer {
                 norm_ff1: Norm::load(m, &format!("{p}.norm_feed_forward1"))?,
                 ff1: (lin("feed_forward1.linear1")?, lin("feed_forward1.linear2")?),
@@ -145,7 +158,8 @@ impl Vad {
                 o: lin("self_attn.linear_out")?,
                 norm_conv: Norm::load(m, &format!("{p}.norm_conv"))?,
                 pw1: lin("conv.pointwise_conv1")?,
-                dw_w: tensor_f32(m, &format!("{p}.conv.depthwise_conv.weight"))?,
+                dw_w,
+                taps,
                 dw_b: tensor_f32(m, &format!("{p}.conv.depthwise_conv.bias"))?,
                 conv_norm: Norm::load(m, &format!("{p}.conv.batch_norm"))?,
                 pw2: lin("conv.pointwise_conv2")?,
@@ -166,7 +180,7 @@ impl Vad {
                 sin.push(a.sin());
             }
         }
-        Ok(Self { mel: Mel::load(m, "vad.preprocessor")?, pre, layers, head: Lin::load(m, "vad.head.decoder_layers.0")?, dim, heads, kernel, window: steps * 4, cos, sin })
+        Ok(Self { mel: Mel::load(m, "vad.preprocessor")?, pre, layers, head: Lin::load(m, "vad.head.decoder_layers.0")?, dim, heads, kernel, window: steps * 4, cos, sin, key: m.uid() ^ 0x5641_4400, dev_off: Default::default() })
     }
 
     /// Seconds between two probabilities.
@@ -174,28 +188,92 @@ impl Vad {
         (4 * super::HOP) as f64 / super::SR as f64
     }
 
+    /// The model as a device that runs it itself takes it.
+    fn ga_args(&self) -> crate::gpu::GaVadArgs<'_> {
+        fn norm(n: &Norm) -> (&[f32], &[f32]) {
+            (&n.w, &n.b)
+        }
+        let pre = |i: usize| (self.pre[i].0.as_slice(), self.pre[i].1.as_slice(), self.pre[i].2, self.pre[i].3);
+        crate::gpu::GaVadArgs {
+            key: self.key,
+            n_mel: self.mel.n_mel(),
+            dim: self.dim,
+            heads: self.heads,
+            kernel: self.kernel,
+            pre: [pre(0), pre(1)],
+            layers: self
+                .layers
+                .iter()
+                .map(|l| crate::gpu::GaVadLayer {
+                    norm_ff1: norm(&l.norm_ff1),
+                    ff1: (l.ff1.0.ga(), l.ff1.1.ga()),
+                    norm_att: norm(&l.norm_att),
+                    q: l.q.ga(),
+                    k: l.k.ga(),
+                    v: l.v.ga(),
+                    o: l.o.ga(),
+                    norm_conv: norm(&l.norm_conv),
+                    pw1: l.pw1.ga(),
+                    taps: &l.taps,
+                    dw_b: &l.dw_b,
+                    conv_norm: norm(&l.conv_norm),
+                    pw2: l.pw2.ga(),
+                    norm_ff2: norm(&l.norm_ff2),
+                    ff2: (l.ff2.0.ga(), l.ff2.1.ga()),
+                    norm_out: norm(&l.norm_out),
+                })
+                .collect(),
+            head: self.head.ga(),
+            cos: &self.cos,
+            sin: &self.sin,
+        }
+    }
+
     /// The speech probability of every 40 ms step of `samples`.
     pub fn probabilities(&self, samples: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+        use std::sync::atomic::Ordering;
         if samples.len() < super::N_FFT {
             return Vec::new();
         }
+        let on_device = Exec::new(pool).resident && !self.dev_off.load(Ordering::Relaxed);
         let ex = Exec { gpu: false, ..Exec::new(pool) };
         let n_mel = self.mel.n_mel();
         let feats = self.mel.features(samples, pool);
         let frames = feats.len() / n_mel;
         let (complete, tail) = (frames / self.window, frames % self.window);
         let mut probs = Vec::with_capacity(frames / 4 + 1);
+        let args = on_device.then(|| self.ga_args());
+        let half = |l: usize| (l - 1) / 2 + 1;
+        // windows of one length on the device, when it has the model: logits back, the sigmoid here
+        let device = |part: &[f32], windows: usize, len: usize, probs: &mut Vec<f32>| -> bool {
+            let Some(args) = &args else { return false };
+            if self.dev_off.load(Ordering::Relaxed) {
+                return false;
+            }
+            let mut logits = vec![0f32; windows * half(half(len))];
+            if !crate::gpu::gigaam_vad(args, part, windows, len, &mut logits) {
+                self.dev_off.store(true, Ordering::Relaxed);
+                return false;
+            }
+            probs.extend(logits.iter().map(|v| 1.0 / (1.0 + (-v).exp())));
+            true
+        };
         // complete windows a batch at a time, then the tail on its own
-        const BATCH: usize = 32;
+        let batch = if on_device { 64 } else { 32 };
         let mut w0 = 0;
         while w0 < complete {
-            let w1 = (w0 + BATCH).min(complete);
-            let lens = vec![self.window; w1 - w0];
-            probs.extend(self.forward(&feats[w0 * self.window * n_mel..w1 * self.window * n_mel], &lens, &ex));
+            let w1 = (w0 + batch).min(complete);
+            let part = &feats[w0 * self.window * n_mel..w1 * self.window * n_mel];
+            if !device(part, w1 - w0, self.window, &mut probs) {
+                probs.extend(self.forward(part, &vec![self.window; w1 - w0], &ex));
+            }
             w0 = w1;
         }
         if tail > 0 {
-            probs.extend(self.forward(&feats[complete * self.window * n_mel..], &[tail], &ex));
+            let part = &feats[complete * self.window * n_mel..];
+            if !device(part, 1, tail, &mut probs) {
+                probs.extend(self.forward(part, &[tail], &ex));
+            }
         }
         probs
     }

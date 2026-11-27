@@ -7,7 +7,7 @@
 //! everything else the kernels of `gigaam.cu`.
 
 use super::*;
-use crate::gpu::{GaFront, GaLin, GigaamArgs};
+use crate::gpu::{GaFront, GaLin, GaVadArgs, GigaamArgs};
 use std::sync::Mutex;
 
 const GA_SRC: &str = include_str!("gigaam.cu");
@@ -26,6 +26,11 @@ struct GaFuncs {
     conv: cs::CUfunction,
     conv2d: cs::CUfunction,
     flat: cs::CUfunction,
+    ln: cs::CUfunction,
+    patch1d: cs::CUfunction,
+    rot_half: cs::CUfunction,
+    planes: cs::CUfunction,
+    glu_conv: cs::CUfunction,
 }
 
 /// A product on the card: the weight plane and its bias (None: no bias).
@@ -87,8 +92,70 @@ fn up_front(fr: &GaFront) -> Res<FrontDev> {
     })
 }
 
+/// A LayerNorm's weight and bias on the card.
+type NormDev = (Buf, Buf);
+
+struct VadLayerDev {
+    norm_ff1: NormDev,
+    ff1: (LinDev, LinDev),
+    norm_att: NormDev,
+    q: LinDev,
+    k: LinDev,
+    v: LinDev,
+    o: LinDev,
+    norm_conv: NormDev,
+    pw1: LinDev,
+    taps: Buf,
+    dw_b: Buf,
+    conv_norm: NormDev,
+    pw2: LinDev,
+    norm_ff2: NormDev,
+    ff2: (LinDev, LinDev),
+    norm_out: NormDev,
+}
+
+struct VadDev {
+    pre: Vec<(Buf, Buf, usize, usize)>,
+    layers: Vec<VadLayerDev>,
+    head: LinDev,
+    cos: Buf,
+    sin: Buf,
+}
+
+fn up_vad(a: &GaVadArgs) -> Res<VadDev> {
+    let mut sc = Vec::new();
+    let norm = |n: (&[f32], &[f32])| -> Res<NormDev> { Ok((Buf::from_slice(n.0)?, Buf::from_slice(n.1)?)) };
+    let mut pre = Vec::with_capacity(2);
+    for (w, b, co, ci) in &a.pre {
+        pre.push((Buf::from_slice(w)?, Buf::from_slice(b)?, *co, *ci));
+    }
+    let mut layers = Vec::with_capacity(a.layers.len());
+    for l in &a.layers {
+        layers.push(VadLayerDev {
+            norm_ff1: norm(l.norm_ff1)?,
+            ff1: (up_lin(&l.ff1.0, &mut sc)?, up_lin(&l.ff1.1, &mut sc)?),
+            norm_att: norm(l.norm_att)?,
+            q: up_lin(&l.q, &mut sc)?,
+            k: up_lin(&l.k, &mut sc)?,
+            v: up_lin(&l.v, &mut sc)?,
+            o: up_lin(&l.o, &mut sc)?,
+            norm_conv: norm(l.norm_conv)?,
+            pw1: up_lin(&l.pw1, &mut sc)?,
+            taps: Buf::from_slice(l.taps)?,
+            dw_b: Buf::from_slice(l.dw_b)?,
+            conv_norm: norm(l.conv_norm)?,
+            pw2: up_lin(&l.pw2, &mut sc)?,
+            norm_ff2: norm(l.norm_ff2)?,
+            ff2: (up_lin(&l.ff2.0, &mut sc)?, up_lin(&l.ff2.1, &mut sc)?),
+            norm_out: norm(l.norm_out)?,
+        });
+    }
+    Ok(VadDev { pre, layers, head: up_lin(&a.head, &mut sc)?, cos: Buf::from_slice(a.cos)?, sin: Buf::from_slice(a.sin)? })
+}
+
 struct GaState {
     f: Option<GaFuncs>,
+    vad: Option<(u64, VadDev)>,
     model: Option<(u64, Vec<StackDev>, Buf, Buf)>,
     front: Option<(u64, FrontDev)>,
     /// working buffers by name; they only grow
@@ -114,7 +181,7 @@ fn work(c: &Ctx, bufs: &mut std::collections::HashMap<&'static str, Buf>, name: 
 // SAFETY: the functions and allocations are used under the context's state lock.
 unsafe impl Send for GaState {}
 
-static STATE: Mutex<GaState> = Mutex::new(GaState { f: None, model: None, front: None, work: None });
+static STATE: Mutex<GaState> = Mutex::new(GaState { f: None, vad: None, model: None, front: None, work: None });
 
 fn funcs(c: &Ctx, s: &mut GaState) -> Res<GaFuncs> {
     if let Some(f) = s.f {
@@ -134,6 +201,11 @@ fn funcs(c: &Ctx, s: &mut GaState) -> Res<GaFuncs> {
         conv: func(m, "ga_conv")?,
         conv2d: func(m, "ga_conv2d")?,
         flat: func(m, "ga_flat")?,
+        ln: func(m, "ga_ln")?,
+        patch1d: func(m, "ga_patch1d")?,
+        rot_half: func(m, "ga_rot_half")?,
+        planes: func(m, "ga_planes")?,
+        glu_conv: func(m, "ga_glu_conv")?,
     };
     s.f = Some(f);
     Ok(f)
@@ -437,6 +509,129 @@ unsafe fn run(c: &Ctx, s: &mut GaState, a: &GigaamArgs, x: &mut [f32], t: usize,
     }
     if a.prof {
         eprintln!("gigaam (cuda, resident): {t} frames, {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+    }
+    Ok(())
+}
+
+/// The voice-activity logits of `windows` windows of `frames` mel frames
+/// (`feats` is `[windows·frames, n_mel]`) into `out`; `false` = declined.
+pub fn gigaam_vad(a: &GaVadArgs, feats: &[f32], windows: usize, frames: usize, out: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    if c.current().is_err() {
+        return false;
+    }
+    let _st = c.st.lock().unwrap();
+    let mut s = STATE.lock().unwrap();
+    match unsafe { vad_run(c, &mut s, a, feats, windows, frames, out) } {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = c.sync();
+            decline("gigaam vad", &e);
+            false
+        }
+    }
+}
+
+unsafe fn vad_run(c: &Ctx, s: &mut GaState, a: &GaVadArgs, feats: &[f32], windows: usize, frames: usize, out: &mut [f32]) -> Res<()> {
+    let (d, nh) = (a.dim, a.heads);
+    let hd = d / nh.max(1);
+    let half = |l: usize| (l - 1) / 2 + 1;
+    if windows == 0 || frames == 0 || feats.len() != windows * frames * a.n_mel || nh * hd != d || hd % 2 != 0 {
+        return Err("a voice-activity shape outside the kernels".into());
+    }
+    let (l1, steps) = (half(frames), half(half(frames)));
+    if out.len() != windows * steps || a.cos.len() < steps * hd / 2 || a.pre[0].3 != a.n_mel || a.pre[1].2 != d {
+        return Err("a voice-activity shape outside the kernels".into());
+    }
+    let f = funcs(c, s)?;
+    if s.vad.as_ref().is_none_or(|m| m.0 != a.key || m.1.layers.len() != a.layers.len()) {
+        s.vad = None;
+        s.vad = Some((a.key, up_vad(a)?));
+    }
+    let GaState { vad, work: bufs, .. } = s;
+    let dev = &vad.as_ref().expect("set above").1;
+    let bufs = bufs.get_or_insert_with(Default::default);
+    // every product in plain f32: a probability near a threshold must not move
+    let ops = Ops { c, f, mode: Gemm::F32 };
+    let n = windows * steps;
+    let (c0, c1) = (a.pre[0].2, a.pre[1].2);
+    let mut b = |name: &'static str, bytes: usize| work(c, bufs, name, bytes);
+    let fin = b("v_in", feats.len() * 4)?;
+    let patch = b("v_patch", (windows * l1 * 3 * a.n_mel).max(n * 3 * c0) * 4)?;
+    let y1 = b("v_y1", windows * l1 * c0 * 4)?;
+    let wide = a.layers.iter().map(|l| l.ff1.0.rows.max(l.pw1.rows)).max().unwrap_or(2 * d);
+    let (r, xn, tmp, rot) = (b("v_r", n * c1.max(d) * 4)?, b("v_xn", n * d * 4)?, b("v_tmp", n * d * 4)?, b("v_rot", n * d * 4)?);
+    let up = b("v_wide", n * wide * 4)?;
+    let (q, k, v, qp, kp, vp) = (b("v_q", n * d * 4)?, b("v_k", n * d * 4)?, b("v_v", n * d * 4)?, b("v_qp", n * d * 4)?, b("v_kp", n * d * 4)?, b("v_vp", n * d * 4)?);
+    let sc = b("v_scores", windows * nh * steps * steps * 4)?;
+    let ln = |src: u64, w: &NormDev, dst: u64| -> Res<()> {
+        let (r_i, c_i, eps) = (n as i32, d as i32, 1e-5f32);
+        unsafe { c.launch(f.ln, rows_grid(n), 256, 0, kargs!(src, w.0.ptr, w.1.ptr, dst, r_i, c_i, eps)) }
+    };
+    let scale = (hd as f32).powf(-0.5);
+    let (win_i, nh_i, hd_i, d_i, k_i) = (steps as i32, nh as i32, hd as i32, d as i32, a.kernel as i32);
+    unsafe {
+        cu::memcpy_htod_async(fin, feats, c.stream).map_err(derr)?;
+        // the two strided convolutions: patches, a product, bias and ReLU
+        let (tot, wi, wo, ci) = ((windows * l1 * 3 * a.n_mel) as u64, frames as i32, l1 as i32, a.n_mel as i32);
+        c.launch(f.patch1d, blocks(tot as usize), 256, 0, kargs!(fin, patch, tot, wi, wo, ci))?;
+        let (w0, b0) = (&dev.pre[0].0, &dev.pre[0].1);
+        c.gemm(true, false, c0, windows * l1, 3 * a.n_mel, 1.0, w0.ptr, 3 * a.n_mel, patch, 3 * a.n_mel, 0.0, y1, c0, Gemm::F32)?;
+        let (t1, c0_i, one, relu) = ((windows * l1 * c0) as u64, c0 as i32, 1i32, 2i32);
+        c.launch(f.bias_act, blocks(t1 as usize), 256, 0, kargs!(y1, b0.ptr, t1, c0_i, one, relu))?;
+        let (tot, wi, wo, ci) = ((n * 3 * c0) as u64, l1 as i32, steps as i32, c0 as i32);
+        c.launch(f.patch1d, blocks(tot as usize), 256, 0, kargs!(y1, patch, tot, wi, wo, ci))?;
+        let (w1, b1) = (&dev.pre[1].0, &dev.pre[1].1);
+        c.gemm(true, false, c1, n, 3 * c0, 1.0, w1.ptr, 3 * c0, patch, 3 * c0, 0.0, r, c1, Gemm::F32)?;
+        let (t2, c1_i) = ((n * c1) as u64, c1 as i32);
+        c.launch(f.bias_act, blocks(t2 as usize), 256, 0, kargs!(r, b1.ptr, t2, c1_i, one, relu))?;
+        for l in &dev.layers {
+            // feed-forward, half weight
+            ln(r, &l.norm_ff1, xn)?;
+            ops.lin(&l.ff1.0, xn, up, n, 1)?;
+            ops.lin(&l.ff1.1, up, tmp, n, 0)?;
+            ops.axpy(r, tmp, n * d, 0.5)?;
+            // attention inside each window
+            ln(r, &l.norm_att, xn)?;
+            let pairs = (n * nh * hd / 2) as u64;
+            c.launch(f.rot_half, blocks(pairs as usize), 256, 0, kargs!(xn, dev.cos.ptr, dev.sin.ptr, rot, pairs, win_i, nh_i, hd_i))?;
+            ops.lin(&l.q, rot, q, n, 0)?;
+            ops.lin(&l.k, rot, k, n, 0)?;
+            ops.lin(&l.v, xn, v, n, 0)?;
+            let (tot, fwd, back) = ((n * d) as u64, 0i32, 1i32);
+            for (src, dst) in [(q, qp), (k, kp), (v, vp)] {
+                c.launch(f.planes, blocks(n * d), 256, 0, kargs!(src, dst, tot, win_i, nh_i, hd_i, fwd))?;
+            }
+            let count = windows * nh;
+            c.gemm_batched(true, steps, steps, hd, scale, kp, hd, steps * hd, qp, hd, steps * hd, sc, steps, steps * steps, count, Gemm::F32)?;
+            c.launch(f.softmax, rows_grid(count * steps), 256, 0, kargs!(sc, (count * steps) as i32, win_i))?;
+            c.gemm_batched(false, hd, steps, steps, 1.0, vp, hd, steps * hd, sc, steps, steps * steps, qp, hd, steps * hd, count, Gemm::F32)?;
+            c.launch(f.planes, blocks(n * d), 256, 0, kargs!(qp, xn, tot, win_i, nh_i, hd_i, back))?;
+            ops.lin(&l.o, xn, tmp, n, 0)?;
+            ops.axpy(r, tmp, n * d, 1.0)?;
+            // convolution module
+            ln(r, &l.norm_conv, xn)?;
+            ops.lin(&l.pw1, xn, up, n, 0)?;
+            c.launch(f.glu_conv, blocks(n * d), 256, 0, kargs!(up, l.taps.ptr, l.dw_b.ptr, tmp, tot, win_i, d_i, k_i))?;
+            ln(tmp, &l.conv_norm, xn)?;
+            let (zero, silu) = (0i32, 1i32);
+            c.launch(f.bias_act, blocks(n * d), 256, 0, kargs!(xn, xn, tot, d_i, zero, silu))?;
+            ops.lin(&l.pw2, xn, tmp, n, 0)?;
+            ops.axpy(r, tmp, n * d, 1.0)?;
+            // feed-forward, half weight; the output norm
+            ln(r, &l.norm_ff2, xn)?;
+            ops.lin(&l.ff2.0, xn, up, n, 1)?;
+            ops.lin(&l.ff2.1, up, tmp, n, 0)?;
+            ops.axpy(r, tmp, n * d, 0.5)?;
+            ln(r, &l.norm_out, xn)?;
+            ops.scale(r, xn, n * d, 1.0)?;
+        }
+        ops.lin(&dev.head, r, tmp, n, 0)?;
+        cu::memcpy_dtoh_async(out, tmp, c.stream).map_err(derr)?;
+    }
+    c.sync()?;
+    if !out.iter().all(|v| v.is_finite()) {
+        return Err("the voice-activity model came back with a value that is not finite".into());
     }
     Ok(())
 }

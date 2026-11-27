@@ -5,7 +5,7 @@
 
 __device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-// y += b a row; act 1: SiLU after.
+// y += b a row; act 1: SiLU after, 2: ReLU.
 extern "C" __global__ void ga_bias_act(float* __restrict__ y, const float* __restrict__ b, unsigned long long total, int cols,
                                        int has_bias, int act)
 {
@@ -14,6 +14,7 @@ extern "C" __global__ void ga_bias_act(float* __restrict__ y, const float* __res
     float v = y[i];
     if (has_bias) v += b[i % cols];
     if (act == 1) v = v * sigm(v);
+    else if (act == 2) v = fmaxf(v, 0.0f);
     y[i] = v;
 }
 
@@ -221,4 +222,112 @@ extern "C" __global__ void ga_flat(const float* __restrict__ x, float* __restric
     if (i >= (unsigned long long)c * t * f) return;
     const int ff = (int)(i % f), cc = (int)((i / f) % c), tt = (int)(i / ((unsigned long long)f * c));
     y[i] = x[((size_t)cc * t + tt) * f + ff];
+}
+
+// ---- the voice-activity model -------------------------------------------
+
+// LayerNorm with bias, a block of 256 a row.
+extern "C" __global__ void ga_ln(const float* __restrict__ src, const float* __restrict__ w, const float* __restrict__ b,
+                                 float* __restrict__ dst, int rows, int cols, float eps)
+{
+    __shared__ float red[256];
+    const int row = blockIdx.x + blockIdx.y * 65535, t = threadIdx.x;
+    if (row >= rows) return;
+    const float* x = src + (size_t)row * cols;
+    float s = 0.0f;
+    for (int i = t; i < cols; i += 256) s += x[i];
+    red[t] = s;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (t < st) red[t] += red[t + st];
+        __syncthreads();
+    }
+    const float mean = red[0] / (float)cols;
+    __syncthreads();
+    float v = 0.0f;
+    for (int i = t; i < cols; i += 256) {
+        const float d = x[i] - mean;
+        v = fmaf(d, d, v);
+    }
+    red[t] = v;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (t < st) red[t] += red[t + st];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / (float)cols + eps);
+    float* y = dst + (size_t)row * cols;
+    for (int i = t; i < cols; i += 256) y[i] = (x[i] - mean) * inv * w[i] + b[i];
+}
+
+// Patches of a kernel-3 stride-2 convolution over time with one zero frame on
+// both sides: x [windows win_in][ci] to y [windows win_out][3][ci].
+extern "C" __global__ void ga_patch1d(const float* __restrict__ x, float* __restrict__ y, unsigned long long total, int win_in,
+                                      int win_out, int ci)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int c = (int)(i % ci), k = (int)((i / ci) % 3);
+    const unsigned long long row = i / ((unsigned long long)ci * 3);
+    const int t = (int)(row % win_out);
+    const unsigned long long wi = row / win_out;
+    const int s = 2 * t + k - 1;
+    y[i] = (s >= 0 && s < win_in) ? x[(wi * win_in + s) * ci + c] : 0.0f;
+}
+
+// Rows [n][nh hd] rotated by the step's angles (cs / sn [win][hd / 2]): lane
+// j of a head with lane j + hd / 2. A row's step is its index in its window.
+extern "C" __global__ void ga_rot_half(const float* __restrict__ x, const float* __restrict__ cs, const float* __restrict__ sn,
+                                       float* __restrict__ y, unsigned long long total, int win, int nh, int hd)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int half = hd / 2, d = nh * hd;
+    if (i >= total) return;
+    // one thread a (row, head, pair)
+    const int j = (int)(i % half), h = (int)((i / half) % nh);
+    const unsigned long long row = i / ((unsigned long long)half * nh);
+    const int pos = (int)(row % win);
+    const float c = cs[(size_t)pos * half + j], s = sn[(size_t)pos * half + j];
+    const float* xr = x + row * d + h * hd;
+    float* yr = y + row * d + h * hd;
+    yr[j] = xr[j] * c - xr[half + j] * s;
+    yr[half + j] = xr[half + j] * c + xr[j] * s;
+}
+
+// Rows [windows win][nh hd] to planes [windows][nh][win][hd] (`back` 0), or
+// planes back to rows (`back` 1).
+extern "C" __global__ void ga_planes(const float* __restrict__ src, float* __restrict__ dst, unsigned long long total, int win,
+                                     int nh, int hd, int back)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int e = (int)(i % hd), h = (int)((i / hd) % nh);
+    const unsigned long long row = i / ((unsigned long long)hd * nh);
+    const int t = (int)(row % win);
+    const unsigned long long wi = row / win;
+    const unsigned long long plane = ((wi * nh + h) * win + t) * hd + e;
+    if (back) dst[i] = src[plane];
+    else dst[plane] = src[i];
+}
+
+// The convolution module's middle: u rows are [n][2 d] (values, then gates);
+// y[row][c] = bias[c] + sum over taps of taps[j][c] * g, g = value * sigmoid(gate)
+// of the row j - (k - 1) / 2 away inside the same window (zero outside).
+extern "C" __global__ void ga_glu_conv(const float* __restrict__ u, const float* __restrict__ taps, const float* __restrict__ bias,
+                                       float* __restrict__ y, unsigned long long total, int win, int d, int k)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int c = (int)(i % d);
+    const unsigned long long row = i / d;
+    const int t = (int)(row % win), half = (k - 1) / 2;
+    const unsigned long long w0 = row - t;
+    float acc = bias[c];
+    for (int j = 0; j < k; j++) {
+        const int s = t + j - half;
+        if (s < 0 || s >= win) continue;
+        const float* ur = u + (w0 + s) * 2 * d;
+        acc = fmaf(taps[(size_t)j * d + c], ur[c] * sigm(ur[d + c]), acc);
+    }
+    y[i] = acc;
 }

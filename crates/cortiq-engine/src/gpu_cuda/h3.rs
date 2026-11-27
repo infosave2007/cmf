@@ -61,7 +61,7 @@ mod vit;
 pub use vit::{sam_encode, vit_encode};
 #[path = "gigaam.rs"]
 mod gigaam;
-pub use gigaam::{gigaam_encode, gigaam_encode_feats};
+pub use gigaam::{gigaam_encode, gigaam_encode_feats, gigaam_vad};
 #[path = "primal.rs"]
 mod primal;
 pub use primal::primal_vae_run;

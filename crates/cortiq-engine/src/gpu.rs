@@ -5668,6 +5668,70 @@ pub struct GigaamArgs<'a> {
     pub front: Option<GaFront<'a>>,
 }
 
+/// One layer of GigaAM's voice-activity Conformer for [`gigaam_vad`], over
+/// rows `r` (`[n, dim]`); a norm is LayerNorm (weight, bias, eps 1e-5):
+/// `r += ½·ff1(norm_ff1(r))` (linear, SiLU, linear);
+/// `xn = norm_att(r)`, queries and keys from `q` / `k` of `xn` rotated by the
+/// step's angles (lane j of a head with lane j + head_dim/2), values from `v`
+/// of `xn` itself, attention inside a window, `r += o(context)`;
+/// `u = pw1(norm_conv(r))` (`[n, 2·dim]`), `g = u[..dim]·σ(u[dim..])`, a
+/// depthwise convolution over time inside the window (`taps` `[kernel][dim]`,
+/// zeros outside), `r += pw2(silu(conv_norm(conv)))`;
+/// `r += ½·ff2(norm_ff2(r))`; `r = norm_out(r)`.
+pub struct GaVadLayer<'a> {
+    pub norm_ff1: (&'a [f32], &'a [f32]),
+    pub ff1: (GaLin<'a>, GaLin<'a>),
+    pub norm_att: (&'a [f32], &'a [f32]),
+    pub q: GaLin<'a>,
+    pub k: GaLin<'a>,
+    pub v: GaLin<'a>,
+    pub o: GaLin<'a>,
+    pub norm_conv: (&'a [f32], &'a [f32]),
+    pub pw1: GaLin<'a>,
+    pub taps: &'a [f32],
+    pub dw_b: &'a [f32],
+    pub conv_norm: (&'a [f32], &'a [f32]),
+    pub pw2: GaLin<'a>,
+    pub norm_ff2: (&'a [f32], &'a [f32]),
+    pub ff2: (GaLin<'a>, GaLin<'a>),
+    pub norm_out: (&'a [f32], &'a [f32]),
+}
+
+/// GigaAM's voice-activity model for [`gigaam_vad`]: two convolutions over
+/// time (kernel 3, stride 2, one zero frame on both sides, ReLU; `pre[i]` =
+/// weight `[out][3][in]`, bias, out, in), the layers, and `head` (one logit
+/// a step). `cos` / `sin` are `[step][head_dim / 2]`.
+pub struct GaVadArgs<'a> {
+    pub key: u64,
+    pub n_mel: usize,
+    pub dim: usize,
+    pub heads: usize,
+    pub kernel: usize,
+    pub pre: [(&'a [f32], &'a [f32], usize, usize); 2],
+    pub layers: Vec<GaVadLayer<'a>>,
+    pub head: GaLin<'a>,
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+}
+
+/// The voice-activity logits of `windows` windows of `frames` mel frames
+/// each, laid back to back in `feats` (`[windows·frames, n_mel]`); every
+/// window is on its own. `out` receives `windows·steps` logits, `steps`
+/// being `frames` halved twice (each time `(l − 1) / 2 + 1`). `false` =
+/// declined: the caller runs the host model.
+#[allow(unused_variables)]
+pub fn gigaam_vad(a: &GaVadArgs, feats: &[f32], windows: usize, frames: usize, out: &mut [f32]) -> bool {
+    if std::env::var("CMF_GIGAAM_RESIDENT").as_deref() == Ok("0") || std::env::var("CMF_GIGAAM_VAD_DEV").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::gigaam_vad(a, feats, windows, frames, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// The front end and the encoder stacks of one segment on the device:
 /// `feats` is `[frames, n_mel]` log-mel, `out` (`[⌈⌈frames/2⌉/2⌉, width]`)
 /// receives the encoder output. `false` = declined (a backend without the
