@@ -112,6 +112,15 @@ impl Lin {
         };
         let host = match e.dtype {
             TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Bf16 => HostW::Dense(tensor_f32(m, weight)?),
+            TensorDtype::Q8Row | TensorDtype::Q8_2f if rows * cols < 1 << 16 => {
+                // a small matrix: floats cost nothing and skip the tile
+                let q = QTensor::from_model(m, weight)?;
+                let mut d = vec![0f32; rows * cols];
+                for (r, row) in d.chunks_exact_mut(cols).enumerate() {
+                    q.row_f32(r, row);
+                }
+                HostW::Dense(d)
+            }
             TensorDtype::Q8Row | TensorDtype::Q8_2f => {
                 let b = m.entry_bytes(e);
                 let f16s = |off: usize, n: usize| -> Vec<f32> {
@@ -130,9 +139,20 @@ impl Lin {
         if !bias.is_empty() && bias.len() != rows {
             return Err(format!("{weight}: bias of {} for {rows} rows", bias.len()));
         }
-        let lin = Self { model: m.clone(), idx, rows, cols, host, bias, dev: OnceLock::new() };
+        let mut lin = Self { model: m.clone(), idx, rows, cols, host, bias, dev: OnceLock::new() };
         if matches!(lin.host, HostW::Rows) && lin.qtensor().is_none() {
             return Err(format!("{weight}: codec {:?} is not supported here", e.dtype));
+        }
+        // `CMF_GIGAAM_DENSE=1`: keep every weight as floats in memory (four
+        // bytes a weight, about 0.95 GB for the model) — a short clip then
+        // pays no widening at all; a four-bit file is always expanded on the
+        // host, its row decoder being slower than the product it feeds.
+        let dense_all = std::env::var("CMF_GIGAAM_DENSE").is_ok_and(|v| v == "1");
+        let host_only = !crate::gpu::enabled_here();
+        if (dense_all && matches!(lin.host, HostW::Q8 { .. })) || (matches!(lin.host, HostW::Rows) && (dense_all || host_only)) {
+            let mut d = vec![0f32; rows * cols];
+            crate::gpu::GaWeight::fill(&lin, &mut d);
+            lin.host = HostW::Dense(d);
         }
         Ok(lin)
     }

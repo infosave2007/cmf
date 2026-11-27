@@ -44,16 +44,22 @@ impl Norm {
     }
 
     /// LayerNorm over rows of `dim` (eps 1e-5).
-    fn apply(&self, x: &[f32], dim: usize) -> Vec<f32> {
+    fn apply(&self, x: &[f32], dim: usize, pool: Option<&Pool>) -> Vec<f32> {
         let mut out = vec![0f32; x.len()];
-        for (dst, src) in out.chunks_exact_mut(dim).zip(x.chunks_exact(dim)) {
-            let mean = src.iter().sum::<f32>() / dim as f32;
-            let var = src.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / dim as f32;
-            let inv = 1.0 / (var + 1e-5).sqrt();
-            for (((d, &v), &w), &b) in dst.iter_mut().zip(src).zip(&self.w).zip(&self.b) {
-                *d = (v - mean) * inv * w + b;
+        let op = ops::Shared(out.as_mut_ptr());
+        ops::par(pool, x.len() / dim, 256, &|a, b| {
+            for r in a..b {
+                let src = &x[r * dim..(r + 1) * dim];
+                let mean = ops::sum(src) / dim as f32;
+                let var = ops::sumsq_about(src, mean) / dim as f32;
+                let inv = 1.0 / (var + 1e-5).sqrt();
+                // SAFETY: row `r` belongs to this range alone.
+                let dst = unsafe { op.slice(r * dim, dim) };
+                for (((d, &v), &w), &b) in dst.iter_mut().zip(src).zip(&self.w).zip(&self.b) {
+                    *d = (v - mean) * inv * w + b;
+                }
             }
-        }
+        });
         out
     }
 }
@@ -256,7 +262,7 @@ impl VadLayer {
         let n: usize = lens.iter().sum();
         let mut r = x;
         let ff = |norm: &Norm, f: &(Lin, Lin), r: &mut Vec<f32>| {
-            let mut h = f.0.apply(&norm.apply(r, d), n, ex);
+            let mut h = f.0.apply(&norm.apply(r, d, ex.pool), n, ex);
             super::silu_par(&mut h, ex.pool);
             let y = f.1.apply(&h, n, ex);
             for (a, b) in r.iter_mut().zip(&y) {
@@ -265,7 +271,7 @@ impl VadLayer {
         };
         ff(&self.norm_ff1, &self.ff1, &mut r);
         // attention: queries and keys are the rotated input, values the input itself
-        let xn = self.norm_att.apply(&r, d);
+        let xn = self.norm_att.apply(&r, d, ex.pool);
         let mut rot = vec![0f32; n * d];
         let mut row0 = 0;
         for &t in lens {
@@ -285,40 +291,48 @@ impl VadLayer {
         let (q, k, v) = (self.q.apply(&rot, n, ex), self.k.apply(&rot, n, ex), self.v.apply(&xn, n, ex));
         let mut ctx = vec![0f32; n * d];
         let scale = (hd as f32).powf(-0.5);
-        let mut row0 = 0;
         let cp = ops::Shared(ctx.as_mut_ptr());
+        let mut starts = Vec::with_capacity(lens.len());
+        let mut at = 0;
         for &t in lens {
-            ops::par(ex.pool, heads, 2, &|a, b| {
-                let plane = |src: &[f32], h: usize| -> Vec<f32> {
-                    let mut p = vec![0f32; t * hd];
+            starts.push(at);
+            at += t;
+        }
+        // every (window, head) is a task of its own
+        ops::par(ex.pool, lens.len() * heads, 1, &|a, b| {
+            let (mut scores, mut out) = (Vec::new(), Vec::new());
+            let (mut qh, mut kh, mut vh) = (Vec::new(), Vec::new(), Vec::new());
+            for task in a..b {
+                let (wi, h) = (task / heads, task % heads);
+                let (row0, t) = (starts[wi], lens[wi]);
+                let plane = |src: &[f32], p: &mut Vec<f32>| {
+                    p.resize(t * hd, 0.0);
                     for i in 0..t {
                         p[i * hd..(i + 1) * hd].copy_from_slice(&src[(row0 + i) * d + h * hd..][..hd]);
                     }
-                    p
                 };
-                let mut scores = vec![0f32; t * t];
-                let mut out = vec![0f32; t * hd];
-                for h in a..b {
-                    let (qh, kh, vh) = (plane(&q, h), plane(&k, h), plane(&v, h));
-                    ops::gemm_nt(&qh, &kh, &mut scores, t, t, hd, None);
-                    for row in scores.chunks_exact_mut(t) {
-                        ops::softmax_scaled(row, scale);
-                    }
-                    ops::gemm_nn(&scores, &vh, &mut out, t, hd, t, None);
-                    for i in 0..t {
-                        // SAFETY: the head's columns of every row belong to this head alone.
-                        unsafe { cp.slice((row0 + i) * d + h * hd, hd) }.copy_from_slice(&out[i * hd..(i + 1) * hd]);
-                    }
+                plane(&q, &mut qh);
+                plane(&k, &mut kh);
+                plane(&v, &mut vh);
+                scores.resize(t * t, 0.0);
+                out.resize(t * hd, 0.0);
+                ops::gemm_nt(&qh, &kh, &mut scores, t, t, hd, None);
+                for row in scores.chunks_exact_mut(t) {
+                    ops::softmax_scaled(row, scale);
                 }
-            });
-            row0 += t;
-        }
+                ops::gemm_nn(&scores, &vh, &mut out, t, hd, t, None);
+                for i in 0..t {
+                    // SAFETY: the head's columns of the window's rows belong to this task alone.
+                    unsafe { cp.slice((row0 + i) * d + h * hd, hd) }.copy_from_slice(&out[i * hd..(i + 1) * hd]);
+                }
+            }
+        });
         let a = self.o.apply(&ctx, n, ex);
         for (x, y) in r.iter_mut().zip(&a) {
             *x += y;
         }
         // convolution module: 1×1 up, GLU, depthwise, LayerNorm, SiLU, 1×1 down
-        let up = self.pw1.apply(&self.norm_conv.apply(&r, d), n, ex);
+        let up = self.pw1.apply(&self.norm_conv.apply(&r, d, ex.pool), n, ex);
         let mut glu = vec![0f32; n * d];
         for (dst, src) in glu.chunks_exact_mut(d).zip(up.chunks_exact(2 * d)) {
             dst.copy_from_slice(&src[..d]);
@@ -330,14 +344,14 @@ impl VadLayer {
             ops::depthwise1d(&glu[row0 * d..(row0 + t) * d], t, d, &self.dw_w, &self.dw_b, vad.kernel, &mut conv[row0 * d..(row0 + t) * d], ex.pool);
             row0 += t;
         }
-        let mut c = self.conv_norm.apply(&conv, d);
+        let mut c = self.conv_norm.apply(&conv, d, ex.pool);
         super::silu_par(&mut c, ex.pool);
         let c = self.pw2.apply(&c, n, ex);
         for (x, y) in r.iter_mut().zip(&c) {
             *x += y;
         }
         ff(&self.norm_ff2, &self.ff2, &mut r);
-        self.norm_out.apply(&r, d)
+        self.norm_out.apply(&r, d, ex.pool)
     }
 }
 

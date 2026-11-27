@@ -173,6 +173,28 @@ simd_fn!(
 );
 
 #[inline(always)]
+fn mul_scaled_body(x: &mut [f32], s: &[f32], a: f32) {
+    for (v, &s) in x.iter_mut().zip(s) {
+        *v *= s * a;
+    }
+}
+simd_fn!(
+    /// `x ← x ⊙ s · a`
+    mul_scaled, mul_scaled_body, (x: &mut [f32], s: &[f32], a: f32)
+);
+
+#[inline(always)]
+fn scale_body(x: &mut [f32], a: f32) {
+    for v in x.iter_mut() {
+        *v *= a;
+    }
+}
+simd_fn!(
+    /// `x ← a · x`
+    scale, scale_body, (x: &mut [f32], a: f32)
+);
+
+#[inline(always)]
 fn sumsq_body(x: &[f32], out: &mut f32) {
     // eight lanes, so the reduction vectorizes without reassociation flags
     let mut acc = [0.0f32; 8];
@@ -194,12 +216,108 @@ fn sumsq_body(x: &[f32], out: &mut f32) {
 }
 simd_fn!(sumsq_into, sumsq_body, (x: &[f32], out: &mut f32));
 
+#[inline(always)]
+fn sum_body(x: &[f32], out: &mut f32) {
+    let mut acc = [0.0f32; 8];
+    let chunks = x.chunks_exact(8);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            *a += v;
+        }
+    }
+    let mut s = 0.0f32;
+    for a in acc {
+        s += a;
+    }
+    for &v in tail {
+        s += v;
+    }
+    *out = s;
+}
+simd_fn!(sum_into, sum_body, (x: &[f32], out: &mut f32));
+
+/// Σ x
+pub(super) fn sum(x: &[f32]) -> f32 {
+    let mut s = 0.0;
+    sum_into(x, &mut s);
+    s
+}
+
+#[inline(always)]
+fn sumsq_about_body(x: &[f32], mean: f32, out: &mut f32) {
+    let mut acc = [0.0f32; 8];
+    let chunks = x.chunks_exact(8);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            let d = v - mean;
+            *a += d * d;
+        }
+    }
+    let mut s = 0.0f32;
+    for a in acc {
+        s += a;
+    }
+    for &v in tail {
+        s += (v - mean) * (v - mean);
+    }
+    *out = s;
+}
+simd_fn!(sumsq_about_into, sumsq_about_body, (x: &[f32], mean: f32, out: &mut f32));
+
+/// Σ (x − mean)²
+pub(super) fn sumsq_about(x: &[f32], mean: f32) -> f32 {
+    let mut s = 0.0;
+    sumsq_about_into(x, mean, &mut s);
+    s
+}
+
 /// Σ x²
 pub(super) fn sumsq(x: &[f32]) -> f32 {
     let mut s = 0.0;
     sumsq_into(x, &mut s);
     s
 }
+
+#[inline(always)]
+fn dot_rows_body(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize) {
+    // every weight row against every input row: sixteen lanes a dot, so the
+    // reduction vectorizes without reassociation flags
+    for r in 0..rows {
+        let wr = &w[r * cols..(r + 1) * cols];
+        for i in 0..n {
+            let xi = &x[i * cols..(i + 1) * cols];
+            let (mut a0, mut a1) = ([0.0f32; 8], [0.0f32; 8]);
+            let mut wc = wr.chunks_exact(16);
+            let mut xc = xi.chunks_exact(16);
+            for (wv, xv) in (&mut wc).zip(&mut xc) {
+                for l in 0..8 {
+                    a0[l] += wv[l] * xv[l];
+                    a1[l] += wv[8 + l] * xv[8 + l];
+                }
+            }
+            let mut s = 0.0f32;
+            for l in 0..8 {
+                s += a0[l] + a1[l];
+            }
+            for (wv, xv) in wc.remainder().iter().zip(xc.remainder()) {
+                s += wv * xv;
+            }
+            y[i * rows + r] = s;
+        }
+    }
+}
+simd_fn!(
+    /// `y[n, rows] = x[n, cols] · w[rows, cols]ᵀ` for a handful of input rows:
+    /// plain dot products, no packing (a GEMM would spend its time packing
+    /// the weight for so few rows).
+    dot_rows, dot_rows_body, (w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize)
+);
+
+/// Input rows up to which a float product goes through [`dot_rows`] where
+/// the GEMM is not Accelerate's.
+const SMALL_BATCH: usize = 16;
 
 // ---------------------------------------------------------------------
 // the row-batch product
@@ -231,9 +349,13 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
     if n == 0 || rows == 0 {
         return;
     }
-    // the column field belongs to the activation side of the product
+    // The two scale fields of an eight-bit weight go where they cost less:
+    // into the widened tile (two multiplies a weight, once a call) for a
+    // long batch, onto the activations (a pass over the batch on each side)
+    // for a short one.
+    let fold = n >= 96;
     let scaled: Option<Vec<f32>> = match w {
-        Weight::Q8 { col_field, .. } if !col_field.is_empty() => {
+        Weight::Q8 { col_field, .. } if !fold && !col_field.is_empty() => {
             let mut xs = x.to_vec();
             let xp = Shared(xs.as_mut_ptr());
             par(pool, n, 64, &|a, b| {
@@ -251,9 +373,16 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
     let yp = Shared(y.as_mut_ptr());
     let fill = |tile: &mut [f32], r0: usize, r1: usize| match w {
         Weight::Dense(_) => unreachable!(),
-        Weight::Q8 { codes, .. } => {
+        Weight::Q8 { codes, row_scale, col_field } => {
             for (t, r) in tile.chunks_exact_mut(cols).zip(r0..r1) {
                 widen_i8(t, &codes[r * cols..(r + 1) * cols]);
+                if fold {
+                    if col_field.is_empty() {
+                        scale(t, row_scale[r]);
+                    } else {
+                        mul_scaled(t, col_field, row_scale[r]);
+                    }
+                }
             }
         }
         Weight::Rows(q) => {
@@ -263,7 +392,7 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
         }
     };
     let finish = |r0: usize, r1: usize| {
-        if let Weight::Q8 { row_scale, .. } = w {
+        if let (Weight::Q8 { row_scale, .. }, false) = (w, fold) {
             // SAFETY: columns r0..r1 of every row belong to this tile alone.
             for i in 0..n {
                 let out = unsafe { yp.slice(i * rows + r0, r1 - r0) };
@@ -276,9 +405,29 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
         let out = unsafe { yp.slice(r0, (n - 1) * rows + (r1 - r0)) };
         sgemm_public(n, r1 - r0, cols, 1.0, x, cols, block, cols, true, out, rows);
     };
+    // Off macOS one GEMM is one thread. A long batch is cut into chunks of
+    // rows, one a worker, against the same tile; a short one leaves the
+    // tiles to the workers instead.
+    let workers = pool.map_or(1, |p| p.n_workers() + 1);
+    let by_batch = n >= 4 * workers;
+    let chunked = |block: &[f32], r0: usize, r1: usize| {
+        let per = n.div_ceil(workers).max(4);
+        par(pool, n.div_ceil(per), 1, &|a, b| {
+            for ch in a..b {
+                let (i0, i1) = (ch * per, ((ch + 1) * per).min(n));
+                // SAFETY: rows i0..i1, columns r0..r1 belong to this chunk alone.
+                let out = unsafe { yp.slice(i0 * rows + r0, (i1 - i0 - 1) * rows + (r1 - r0)) };
+                sgemm_public(i1 - i0, r1 - r0, cols, 1.0, &x[i0 * cols..i1 * cols], cols, block, cols, true, out, rows);
+            }
+        });
+    };
     if let Weight::Dense(d) = w {
         if cfg!(target_os = "macos") {
             gemm(d, 0, rows);
+        } else if n <= SMALL_BATCH {
+            dot_rows(d, cols, x, n, y, rows);
+        } else if by_batch {
+            chunked(d, 0, rows);
         } else {
             let step = (TILE_FLOATS / cols).clamp(8, rows.max(8));
             par(pool, rows.div_ceil(step), 1, &|a, b| {
@@ -290,9 +439,11 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
         }
         return;
     }
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") || by_batch {
         // one tile at a time, widened on the pool, multiplied by Accelerate
-        let step = (4 * TILE_FLOATS / cols).clamp(8, rows.max(8));
+        // (or by the workers, a chunk of the batch each)
+        let floats = if cfg!(target_os = "macos") { 4 * TILE_FLOATS } else { 2 * TILE_FLOATS };
+        let step = (floats / cols).clamp(8, rows.max(8));
         let mut tile = vec![0f32; step.min(rows) * cols];
         let mut r0 = 0;
         while r0 < rows {
@@ -303,7 +454,11 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
                 let part = unsafe { tp.slice(a * cols, (b - a) * cols) };
                 fill(part, r0 + a, r0 + b);
             });
-            gemm(&tile[..(r1 - r0) * cols], r0, r1);
+            if cfg!(target_os = "macos") {
+                gemm(&tile[..(r1 - r0) * cols], r0, r1);
+            } else {
+                chunked(&tile[..(r1 - r0) * cols], r0, r1);
+            }
             finish(r0, r1);
             r0 = r1;
         }
@@ -391,7 +546,8 @@ pub(super) fn conv3x3(
     // patches[(to, fo), (ci, kt, kf)], a block of output frames at a time
     let mut out = vec![0f32; co * to * fo];
     let op = Shared(out.as_mut_ptr());
-    let block_t = (1usize << 20).div_ceil(fo * k).max(1);
+    let workers = pool.map_or(1, |p| p.n_workers() + 1);
+    let block_t = (1usize << 20).div_ceil(fo * k).min(to.div_ceil(2 * workers)).max(1);
     par(pool, to.div_ceil(block_t), 1, &|a, b| {
         let mut patches = vec![0f32; block_t * fo * k];
         let mut y = vec![0f32; block_t * fo * co];
@@ -564,6 +720,15 @@ mod tests {
             }
         }
         let pool = Pool::new(3);
+        // a long batch folds the scale fields into the tile: the same product
+        let nl = 130usize;
+        let xl: Vec<f32> = (0..nl * cols).map(|i| ((i * 5 % 17) as f32 - 8.0) * 0.21).collect();
+        let (mut a, mut b) = (vec![0f32; nl * rows], vec![0f32; nl * rows]);
+        matmul(&Weight::Q8 { codes: &codes, row_scale: &row_scale, col_field: &col_field }, rows, cols, &xl, nl, &mut a, Some(&pool));
+        matmul(&Weight::Dense(&dense), rows, cols, &xl, nl, &mut b, None);
+        for (a, b) in a.iter().zip(&b) {
+            assert!((a - b).abs() < 1e-3 * (1.0 + b.abs()), "folded {a} vs {b}");
+        }
         for p in [None, Some(&pool)] {
             let mut got = vec![0f32; n * rows];
             matmul(&Weight::Q8 { codes: &codes, row_scale: &row_scale, col_field: &col_field }, rows, cols, &x, n, &mut got, p);
@@ -572,6 +737,21 @@ mod tests {
             for ((a, b), w) in got.iter().zip(&got_dense).zip(&want) {
                 assert!((a - w).abs() < 1e-3 * (1.0 + w.abs()), "q8 {a} vs {w}");
                 assert!((b - w).abs() < 1e-3 * (1.0 + w.abs()), "dense {b} vs {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn dot_rows_matches_the_float_product() {
+        let (rows, cols, n) = (9usize, 37usize, 3usize);
+        let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.13).collect();
+        let x: Vec<f32> = (0..n * cols).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.3).collect();
+        let mut y = vec![0f32; n * rows];
+        dot_rows(&w, cols, &x, n, &mut y, rows);
+        for i in 0..n {
+            for r in 0..rows {
+                let want: f64 = (0..cols).map(|c| x[i * cols + c] as f64 * w[r * cols + c] as f64).sum();
+                assert!((y[i * rows + r] as f64 - want).abs() < 1e-4);
             }
         }
     }
