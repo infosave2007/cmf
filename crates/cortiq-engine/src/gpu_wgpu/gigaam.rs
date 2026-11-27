@@ -1167,3 +1167,17 @@ pub fn encode(a: &GigaamArgs, x: &mut [f32], t: usize) -> bool {
     }
     true
 }
+
+/// The front end and the stacks of one segment: `feats` (`[frames, n_mel]`)
+/// in, `out` (`[t, width]`) the encoder output; `false` = declined (the
+/// caller runs the front end on the host and calls [`encode`]).
+pub fn encode_feats(_a: &crate::gpu::GigaamArgs, _feats: &[f32], _frames: usize, _out: &mut [f32]) -> bool {
+    false
+}
+
+/// The voice-activity logits of `windows` windows of `frames` mel frames
+/// (`feats` is `[windows·frames, n_mel]`) into `out`; `false` = declined
+/// (the caller runs the host model).
+pub fn vad(_a: &crate::gpu::GaVadArgs, _feats: &[f32], _windows: usize, _frames: usize, _out: &mut [f32]) -> bool {
+    false
+}

@@ -5725,6 +5725,8 @@ pub fn gigaam_vad(a: &GaVadArgs, feats: &[f32], windows: usize, frames: usize, o
         return false;
     }
     match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gigaam::vad(a, feats, windows, frames, out),
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::gigaam_vad(a, feats, windows, frames, out),
         #[allow(unreachable_patterns)]
@@ -5743,6 +5745,8 @@ pub fn gigaam_encode_feats(a: &GigaamArgs, feats: &[f32], frames: usize, out: &m
         return false;
     }
     match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gigaam::encode_feats(a, feats, frames, out),
         #[cfg(feature = "cuda")]
         Backend::Cuda => crate::gpu_cuda::gigaam_encode_feats(a, feats, frames, out),
         #[allow(unreachable_patterns)]
