@@ -55,6 +55,11 @@ def n(lang, v, d=None):
     return s.replace(".", ",") if lang == "ru" else s
 
 
+def grp(v):
+    """An integer with thin groups of three: 13 261."""
+    return f"{v:,}".replace(",", " ")
+
+
 def dur(lang, secs):
     names = {"en": ("s", "min", "h"), "ru": ("с", "мин", "ч"), "zh": ("秒", "分钟", "小时")}[lang]
     if secs < 60:
@@ -114,7 +119,7 @@ def wer_table(lang, T, field):
         rev_tags = [t for t in TAGS if t.startswith(rev)]
         if not rev_tags or not any((rev, s, field) in wer for s, _, _ in SETS):
             continue
-        head = [T["file"]] + [f"{name}, {clips}" for _, name, clips in SETS] + [T["same"]]
+        head = [T["file"]] + [f"{name}, {grp(clips)}" for _, name, clips in SETS] + [T["same"]]
         out += [f"**{'RNN-T' if rev == 'rnnt' else 'CTC'}**", "", "| " + " | ".join(head) + " |", "|---|" + "---:|" * (len(head) - 1)]
         rows = [("reference", T["ref_row"]), ("f16_exact", T["f16_row"])] + [(t.split("-", 1)[1], f"`{files[t]['name']}`") for t in rev_tags]
         for key, title in rows:
@@ -125,7 +130,7 @@ def wer_table(lang, T, field):
                 if e and "identical" in e:
                     same += e["identical"]
                     total += wer[(rev, s, field)]["clips"]
-            cells.append(f"{same} / {total}" if total else "—")
+            cells.append(f"{grp(same)} / {grp(total)}" if total else "—")
             out.append("| " + " | ".join(cells) + " |")
         out.append("")
     return "\n".join(out).rstrip()
@@ -191,6 +196,7 @@ def emit(lang):
     exact_total = sum(c for e, c in exact if e)
     ref30 = ref_speed.get(("rnnt", "cuda", "f32", 30))
     refl = ref_speed.get(("rnnt", "cuda", "f32", cl_s)) if cl_s else None
+    refh = ref_speed.get(("rnnt", "cuda", "f16", cl_s)) if cl_s else None
     ms = lambda v: n(lang, v * 1000, 0)
     if lang == "en":
         P("# GigaAM-v4 — CMF\n")
@@ -214,9 +220,10 @@ def emit(lang):
             pairs = ", ".join(f"{n(lang, we[s][0]['wer'], 2)} % against {n(lang, we[s][1]['wer'], 2)} % on {name}" for s, name, _ in SETS)
             P(f"- **Accuracy:** the word error rate of the 8-bit file is the reference implementation's: {pairs}.")
             if exact_total:
-                P(f"  With the released half-precision weights {exact_same} of {exact_total} transcripts are the reference's, character for character.")
-        if refl and cl:
-            P(f"- **Against the authors' PyTorch code on the same L4:** {dur(lang, cl_s)} take it {n(lang, refl)} s; `cortiq` is {n(lang, refl / cl['time'], 1)} times faster.")
+                P(f"  With the released half-precision weights {grp(exact_same)} of {grp(exact_total)} transcripts are the reference's, character for character.")
+        if refl and refh and cl:
+            P(f"- **Against the authors' PyTorch code on the same L4:** the same {dur(lang, cl_s)} take it {n(lang, refl)} s in float32 and {n(lang, refh)} s with")
+            P(f"  its half-precision encoder; `cortiq` takes {n(lang, cl['time'])} s.")
         P("\n[English](#quick-start) · [Русский](#документация-на-русском) · [中文](#中文文档)\n")
         P("## Quick start\n")
         P("```bash")
@@ -351,9 +358,10 @@ def emit(lang):
             pairs = ", ".join(f"{n(lang, we[s][0]['wer'], 2)} % против {n(lang, we[s][1]['wer'], 2)} % на {name}" for s, name, _ in SETS)
             P(f"- **Точность:** доля ошибок по словам у 8-битного файла та же, что у эталонной реализации: {pairs}.")
             if exact_total:
-                P(f"  С исходными весами половинной точности {exact_same} из {exact_total} транскриптов совпадают с эталоном символ в символ.")
-        if refl and cl:
-            P(f"- **Против кода авторов на PyTorch на той же L4:** {dur(lang, cl_s)} занимают у него {n(lang, refl)} с; `cortiq` быстрее в {n(lang, refl / cl['time'], 1)} раза.")
+                P(f"  С исходными весами половинной точности {grp(exact_same)} из {grp(exact_total)} транскриптов совпадают с эталоном символ в символ.")
+        if refl and refh and cl:
+            P(f"- **Против кода авторов на PyTorch на той же L4:** те же {dur(lang, cl_s)} занимают у него {n(lang, refl)} с во float32 и {n(lang, refh)} с с")
+            P(f"  энкодером половинной точности; у `cortiq` — {n(lang, cl['time'])} с.")
         P("\nБыстрый старт:\n")
         P("```bash")
         P(a.install)
@@ -445,9 +453,9 @@ def emit(lang):
             pairs = "，".join(f"{name} 上 {n(lang, we[s][0]['wer'], 2)} % 对 {n(lang, we[s][1]['wer'], 2)} %" for s, name, _ in SETS)
             P(f"- **准确率：** 8 位文件的词错误率与参考实现相同：{pairs}。")
             if exact_total:
-                P(f"  使用原始半精度权重时，{exact_total} 条转写中有 {exact_same} 条与参考实现逐字符一致。")
-        if refl and cl:
-            P(f"- **与同一张 L4 上作者的 PyTorch 代码相比：** {dur(lang, cl_s)}它需要 {n(lang, refl)} 秒；`cortiq` 快 {n(lang, refl / cl['time'], 1)} 倍。")
+                P(f"  使用原始半精度权重时，{grp(exact_total)} 条转写中有 {grp(exact_same)} 条与参考实现逐字符一致。")
+        if refl and refh and cl:
+            P(f"- **与同一张 L4 上作者的 PyTorch 代码相比：** 同样的{dur(lang, cl_s)}，它用 float32 需要 {n(lang, refl)} 秒，用半精度编码器需要 {n(lang, refh)} 秒；`cortiq` 用时 {n(lang, cl['time'])} 秒。")
         P("\n快速开始：\n")
         P("```bash")
         P(a.install)

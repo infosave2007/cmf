@@ -700,6 +700,30 @@ cortiq transcribe nemotron-3.5-transcribe-30b-a4b-q4tp.cmf a.wav b.wav --stats
 `cortiq convert --model <каталог чекпоинта>` упаковывает чекпоинт NeMo
 (`--quant q8_2f | q4tp | q2tp`).
 
+### GigaAM-v4
+
+`cortiq` целиком на Rust исполняет [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4) — модель распознавания
+речи для русского и английского (Zapformer-энкодер на 238 млн параметров с головами RNN-T или CTC: оформленный
+транскрипт с регистром, пунктуацией и цифрами и простой): мел-фронтенд, энкодер, жадное декодирование RNN-T и
+CTC с временами слов и собственную сеть голосовой активности модели, которая режет запись любой длины на
+сегменты. Готовые файлы — на [Hugging Face](https://huggingface.co/infosave/GigaAM-v4-cmf):
+
+```sh
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf встреча.wav
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf встреча.mp3 --timestamps
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf a.wav b.wav --json --head both
+cortiq serve GigaAM-v4-rnnt-q8_2f.cmf --port 8080   # POST /v1/audio/transcriptions
+```
+
+На GPU энкодер остаётся на карте от первого слоя до последнего, а на CUDA и Vulkan — ещё и сеть голосовой
+активности со свёрточным входом. Полчаса речи занимают 2,73 с на NVIDIA L4 через CUDA (в 660 раз быстрее
+реального времени), 4,64 с через Vulkan, 10,6 с на MacBook Air M4 через Metal и 16,7 с на его CPU. Доля
+ошибок по словам у 8-битного файла та же, что у эталонной реализации, на Golos и Russian LibriSpeech
+(13 262 клипов), а с исходными весами половинной точности 13 261 транскриптов совпадают с эталоном символ в
+символ. Сервер отвечает на `POST /v1/audio/transcriptions` в формате OpenAI (`json`, `text`, `verbose_json` с
+временами слов, `srt`, `vtt`). `cortiq convert --model <каталог чекпоинта> --quant q8_2f | q4tp | f16`
+упаковывает ревизию `rnnt` или `ctc` исходного репозитория.
+
 ### Многоязычный TTS Phonon 40M (0.8.36)
 
 Команды `phonon-pack` и `tts` добавляются в **cortiq-cli 0.8.36**. В уже

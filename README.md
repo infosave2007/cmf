@@ -713,6 +713,30 @@ expert keeps the most used ones and computes the rest on the CPU
 (`CMF_NEMO_EXPERT_GB` sets the budget). `cortiq convert --model <checkpoint dir>`
 packs the NeMo checkpoint (`--quant q8_2f | q4tp | q2tp`).
 
+### GigaAM-v4
+
+`cortiq` runs [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4), a speech recognition model for Russian and
+English (a 238 M-parameter Zapformer encoder with RNN-T or CTC heads: a formatted transcript with case,
+punctuation and digits, and a plain one), end to end in Rust: the mel front end, the encoder, greedy RNN-T and
+CTC decoding with word times, and the model's own voice-activity network, which cuts a recording of any length
+into segments. Ready files are on [Hugging Face](https://huggingface.co/infosave/GigaAM-v4-cmf):
+
+```sh
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf meeting.wav
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf meeting.mp3 --timestamps
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf a.wav b.wav --json --head both
+cortiq serve GigaAM-v4-rnnt-q8_2f.cmf --port 8080   # POST /v1/audio/transcriptions
+```
+
+On a GPU the encoder stays on the card from the first layer to the last — on CUDA and Vulkan the voice-activity
+network and the convolutional front end too. Half an hour of speech takes 2.73 s on an NVIDIA L4 through CUDA
+(660 times faster than real time), 4.64 s through Vulkan, 10.6 s on a MacBook Air M4 through Metal and
+16.7 s on its CPU. The 8-bit file's word error rate is the reference implementation's on Golos and Russian
+LibriSpeech (13 262 clips), and with the released half-precision weights 13 261 of the transcripts are the
+reference's character for character. The server answers `POST /v1/audio/transcriptions` in the OpenAI shape
+(`json`, `text`, `verbose_json` with word times, `srt`, `vtt`). `cortiq convert --model <checkpoint dir>
+--quant q8_2f | q4tp | f16` packs the `rnnt` or the `ctc` revision of the upstream repository.
+
 ### Phonon 40M multilingual text-to-speech (0.8.36)
 
 `phonon-pack` and `tts` are introduced in **cortiq-cli 0.8.36**. The currently

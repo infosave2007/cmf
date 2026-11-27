@@ -115,6 +115,27 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 思考型模型的推理放在 `reasoning_content` 中，回答放在 `content` 中；`"reasoning_format": "none"` 让推理以
 `<think>…</think>` 的形式留在 `content` 中。
 
+## GigaAM-v4：俄语和英语语音识别
+
+`cortiq` 完全用 Rust 运行 [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4)——面向俄语和英语的语音识别模型
+（2.38 亿参数的 Zapformer 编码器，带 RNN-T 或 CTC 识别头：一份带大小写、标点和数字的规范转写，一份纯文本转写）：
+mel 前端、编码器、带词时间的 RNN-T 与 CTC 贪心解码，以及模型自带的语音活动检测网络，它把任意长度的录音切成片段。
+现成文件在 [Hugging Face](https://huggingface.co/infosave/GigaAM-v4-cmf)：
+
+```sh
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf meeting.wav
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf meeting.mp3 --timestamps
+cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf a.wav b.wav --json --head both
+cortiq serve GigaAM-v4-rnnt-q8_2f.cmf --port 8080   # POST /v1/audio/transcriptions
+```
+
+在 GPU 上，编码器从第一层到最后一层都留在显卡上；在 CUDA 和 Vulkan 上，语音活动检测网络和卷积前端也在显卡上。
+半小时语音在 NVIDIA L4 上走 CUDA 用时 2.73 秒（实时的 660 倍），走 Vulkan 用时 4.64 秒，在 MacBook Air M4 上走
+Metal 用时 10.6 秒，只用其 CPU 用时 16.7 秒。8 位文件在 Golos 和 Russian LibriSpeech（13 262 个片段）上的词错误率
+与参考实现相同；使用原始半精度权重时，13 261 条转写与参考实现逐字符一致。服务端以 OpenAI 的格式响应
+`POST /v1/audio/transcriptions`（`json`、`text`、带词时间的 `verbose_json`、`srt`、`vtt`）。
+`cortiq convert --model <检查点目录> --quant q8_2f | q4tp | f16` 打包上游仓库的 `rnnt` 或 `ctc` 版本。
+
 ## Primal VAE:支持 CUDA(0.8.84)
 
 [Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) 现在也可在 CUDA 上编码和解码，整个前向在显卡上一次运行完成;
