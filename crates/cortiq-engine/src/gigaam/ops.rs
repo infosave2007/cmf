@@ -382,6 +382,69 @@ unsafe fn dot_rows_avx2(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f3
     }
 }
 
+/// A short batch against int8 weight rows as they lie in the file: a chunk
+/// of eight codes is widened in the registers and feeds eight (four, one)
+/// input rows, so nothing is unpacked ahead of the product and the weight
+/// streams from memory at a byte a weight. `y[i·ldy + r0 + r]` receives
+/// row `r` of `codes` (`[rows, cols]`) against input row `i`, times
+/// `row_scale[r]`.
+///
+/// # Safety
+/// AVX2 and FMA must be present; `y` must cover `(n − 1)·ldy + r0 + rows`
+/// floats and no other thread may touch columns `r0..r0 + rows` of it.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dot_rows_q8_avx2(codes: &[u8], row_scale: &[f32], cols: usize, x: &[f32], n: usize, y: Shared<f32>, ldy: usize, r0: usize) {
+    use std::arch::x86_64::*;
+    let rows = row_scale.len();
+    assert!(codes.len() >= rows * cols && x.len() >= n * cols);
+    #[inline(always)]
+    unsafe fn hsum(v: __m256) -> f32 {
+        unsafe {
+            let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+            let s = _mm_hadd_ps(s, s);
+            _mm_cvtss_f32(_mm_hadd_ps(s, s))
+        }
+    }
+    let c8 = cols / 8 * 8;
+    // SAFETY: the pointers stay inside the slices asserted above; `y` is the caller's promise.
+    unsafe {
+        let xp = x.as_ptr();
+        for r in 0..rows {
+            let wr = codes.as_ptr().add(r * cols);
+            let scale = *row_scale.get_unchecked(r);
+            let mut i = 0;
+            macro_rules! group {
+                ($g:expr) => {
+                    while i + $g <= n {
+                        let mut acc = [_mm256_setzero_ps(); $g];
+                        let mut c = 0;
+                        while c < c8 {
+                            let wv = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(wr.add(c).cast())));
+                            for k in 0..$g {
+                                acc[k] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xp.add((i + k) * cols + c)), acc[k]);
+                            }
+                            c += 8;
+                        }
+                        for k in 0..$g {
+                            let mut s = hsum(acc[k]);
+                            for c in c8..cols {
+                                s += (*wr.add(c) as i8) as f32 * *xp.add((i + k) * cols + c);
+                            }
+                            *y.0.add((i + k) * ldy + r0 + r) = s * scale;
+                        }
+                        i += $g;
+                    }
+                };
+            }
+            group!(8);
+            group!(4);
+            group!(1);
+        }
+    }
+}
+
 /// `y[n, rows] = x[n, cols] · w[rows, cols]ᵀ` for a handful of input rows:
 /// plain dot products, no packing (a GEMM would spend its time packing the
 /// weight for so few rows).
@@ -467,6 +530,17 @@ pub(super) fn matmul(w: &Weight, rows: usize, cols: usize, x: &[f32], n: usize, 
     };
     let x = scaled.as_deref().unwrap_or(x);
     let yp = Shared(y.as_mut_ptr());
+    // a short batch on x86: straight from the int8 rows, no tile at all
+    #[cfg(target_arch = "x86_64")]
+    if let (Weight::Q8 { codes, row_scale, .. }, false) = (w, fold) {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            par(pool, rows, 16, &|r0, r1| {
+                // SAFETY: the features were just detected; rows r0..r1 are this range's columns of `y`.
+                unsafe { dot_rows_q8_avx2(&codes[r0 * cols..r1 * cols], &row_scale[r0..r1], cols, x, n, yp, rows, r0) };
+            });
+            return;
+        }
+    }
     let fill = |tile: &mut [f32], r0: usize, r1: usize| match w {
         Weight::Dense(_) => unreachable!(),
         Weight::Q8 { codes, row_scale, col_field } => {
@@ -798,7 +872,7 @@ mod tests {
 
     #[test]
     fn q8_product_matches_the_float_product() {
-        let (rows, cols, n) = (37usize, 24usize, 5usize);
+        let (rows, cols, n) = (37usize, 27usize, 5usize);
         let codes: Vec<u8> = (0..rows * cols).map(|i| ((i * 37 + 11) % 255) as u8).collect();
         let row_scale: Vec<f32> = (0..rows).map(|r| 0.01 + r as f32 * 1e-3).collect();
         let col_field: Vec<f32> = (0..cols).map(|c| 0.5 + c as f32 * 0.07).collect();
@@ -816,6 +890,22 @@ mod tests {
             }
         }
         let pool = Pool::new(3);
+        // short batches of every group size (the int8 rows are multiplied as they lie on x86)
+        for ns in [1usize, 4, 13] {
+            for field in [&col_field[..], &[][..]] {
+                let xs: Vec<f32> = (0..ns * cols).map(|i| ((i * 3 % 11) as f32 - 5.0) * 0.17).collect();
+                let mut got = vec![0f32; ns * rows];
+                matmul(&Weight::Q8 { codes: &codes, row_scale: &row_scale, col_field: field }, rows, cols, &xs, ns, &mut got, Some(&pool));
+                for i in 0..ns {
+                    for r in 0..rows {
+                        let want: f64 = (0..cols)
+                            .map(|c| xs[i * cols + c] as f64 * (codes[r * cols + c] as i8 as f64) * row_scale[r] as f64 * field.get(c).copied().unwrap_or(1.0) as f64)
+                            .sum();
+                        assert!((got[i * rows + r] as f64 - want).abs() < 1e-3 * (1.0 + want.abs()), "n={ns} row {r}");
+                    }
+                }
+            }
+        }
         // a long batch folds the scale fields into the tile: the same product
         let nl = 130usize;
         let xl: Vec<f32> = (0..nl * cols).map(|i| ((i * 5 % 17) as f32 - 8.0) * 0.21).collect();
