@@ -59,6 +59,9 @@ pub use sam3::{sam3_attn_core, sam3_attn_sep, sam3_conv2d, sam3_convt2x2, sam3_m
 #[path = "vit.rs"]
 mod vit;
 pub use vit::{sam_encode, vit_encode};
+#[path = "gigaam.rs"]
+mod gigaam;
+pub use gigaam::{gigaam_encode, gigaam_encode_feats, gigaam_vad};
 #[path = "primal.rs"]
 mod primal;
 pub use primal::primal_vae_run;

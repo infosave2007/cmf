@@ -113,3 +113,120 @@ pub fn run_nemotron(
     }
     Ok(())
 }
+
+/// GigaAM-v4: transcribe every file (one load for all of them; with several
+/// files each line is prefixed by the file name).
+#[allow(clippy::too_many_arguments)]
+pub fn run_gigaam(
+    model: &std::sync::Arc<cortiq_core::CmfModel>,
+    audio: &[String],
+    head: &str,
+    stats: bool,
+    timestamps: bool,
+    json: bool,
+    vad: bool,
+) -> Result<()> {
+    use cortiq_engine::gigaam::{self, Heads};
+    let heads = match head {
+        "e2e" | "text" => Heads::E2e,
+        "raw" => Heads::Raw,
+        "both" => Heads::Both,
+        other => anyhow::bail!("--head {other}: use e2e (formatted text), raw (lower-case words) or both"),
+    };
+    let t0 = std::time::Instant::now();
+    let tr = gigaam::Transcriber::load(model).map_err(anyhow::Error::msg)?;
+    if stats {
+        eprintln!("load {:.2}s ({}, device {})", t0.elapsed().as_secs_f64(), tr.revision, cortiq_engine::gpu::backend_name());
+    }
+    let pool = cortiq_engine::pool::Pool::from_env();
+    let opts = gigaam::Options { heads, words: timestamps, force_vad: vad, ..Default::default() };
+    let many = audio.len() > 1;
+    for path in audio {
+        let t1 = std::time::Instant::now();
+        let samples = gigaam::read_audio(std::path::Path::new(path)).map_err(anyhow::Error::msg)?;
+        let read_s = t1.elapsed().as_secs_f64();
+        // Parity tooling: CMF_GIGAAM_TRACE_DIR=<dir> writes the intermediate
+        // tensors of a clip of at most 30 s as .npy instead of transcribing.
+        if let Ok(dir) = std::env::var("CMF_GIGAAM_TRACE_DIR") {
+            std::fs::create_dir_all(&dir)?;
+            for (name, data, width) in tr.trace(&samples, pool.as_deref()).map_err(anyhow::Error::msg)? {
+                write_npy(&std::path::Path::new(&dir).join(format!("{name}.npy")), &data, width)?;
+            }
+            eprintln!("trace written to {dir}");
+            continue;
+        }
+        let out = tr.transcribe(&samples, &opts, pool.as_deref()).map_err(anyhow::Error::msg).with_context(|| format!("transcribing {path}"))?;
+        if json {
+            let part = |t: &Option<gigaam::Transcript>| {
+                t.as_ref().map(|t| {
+                    serde_json::json!({
+                        "text": t.text,
+                        "segments": t.segments.iter().map(|s| serde_json::json!({
+                            "start": s.start, "end": s.end, "text": s.text,
+                            "words": s.words.iter().map(|w| serde_json::json!({"word": w.text, "start": w.start, "end": w.end})).collect::<Vec<_>>(),
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+            };
+            println!(
+                "{}",
+                serde_json::json!({
+                    "file": path, "duration": out.audio_s, "e2e": part(&out.e2e), "raw": part(&out.raw),
+                    "seconds": {"vad": out.vad_s, "features": out.features_s, "encoder": out.encoder_s, "decode": out.decode_s, "total": out.total_s()},
+                })
+            );
+        } else {
+            let name = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path);
+            for (label, t) in [("", &out.e2e), ("raw: ", &out.raw)] {
+                let Some(t) = t else { continue };
+                let label = if heads == Heads::Both { label } else { "" };
+                if many {
+                    println!("{name}: {label}{}", t.text);
+                } else {
+                    println!("{label}{}", t.text);
+                }
+                if timestamps {
+                    for w in t.segments.iter().flat_map(|s| &s.words) {
+                        println!("  {:9.3} {:9.3}  {}", w.start, w.end, w.text);
+                    }
+                }
+            }
+        }
+        if stats {
+            let total = out.total_s();
+            eprintln!(
+                "{path}: audio {:.2}s (speech {:.2}s, {} segments) | read {:.3}s | vad {:.3}s | features {:.3}s | encoder {:.3}s | decode {:.3}s | total {:.3}s = {:.1}x real time (RTF {:.4})",
+                out.audio_s,
+                out.speech_s,
+                out.e2e.as_ref().or(out.raw.as_ref()).map_or(0, |t| t.segments.len()),
+                read_s,
+                out.vad_s,
+                out.features_s,
+                out.encoder_s,
+                out.decode_s,
+                total,
+                out.audio_s / total.max(1e-9),
+                total / out.audio_s.max(1e-9),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A `[rows, width]` float32 array as a NumPy `.npy` file.
+fn write_npy(path: &std::path::Path, data: &[f32], width: usize) -> Result<()> {
+    use std::io::Write;
+    let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {}), }}", data.len() / width.max(1), width);
+    while (10 + header.len() + 1) % 64 != 0 {
+        header.push(' ');
+    }
+    header.push('\n');
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"\x93NUMPY\x01\x00")?;
+    f.write_all(&(header.len() as u16).to_le_bytes())?;
+    f.write_all(header.as_bytes())?;
+    for v in data {
+        f.write_all(&v.to_le_bytes())?;
+    }
+    Ok(())
+}

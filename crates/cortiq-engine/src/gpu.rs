@@ -5564,6 +5564,217 @@ pub fn vit_encode(a: &VitArgs, x: &mut [f32]) -> bool {
     }
 }
 
+/// A weight of the GigaAM encoder as floats, for a device that keeps its
+/// own copy: asked once a weight, when the device cache misses.
+pub trait GaWeight: Sync {
+    /// Fill `dst` (`[rows·cols]`, row-major) with the weight.
+    fn fill(&self, dst: &mut [f32]);
+}
+
+/// One product of the GigaAM encoder for [`gigaam_encode`]:
+/// `y[n, rows] = x[n, cols]·Wᵀ + bias`.
+pub struct GaLin<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    pub weight: &'a dyn GaWeight,
+    /// `[rows]`, or empty: no bias
+    pub bias: &'a [f32],
+}
+
+/// A layer's convolution module: `inp` gives `[n, 2·dim]` (the stream, then
+/// its gate); the stream goes through a depthwise convolution over time
+/// (`taps` is `[kernel][dim]`, `(kernel − 1) / 2` zero frames on both sides,
+/// `bias` `[dim]`) and gets the segment's mean times `mean_w` added; then
+/// `out(silu((conv + mean)·σ(gate)))`.
+pub struct GaConv<'a> {
+    pub inp: GaLin<'a>,
+    pub taps: &'a [f32],
+    pub bias: &'a [f32],
+    pub kernel: usize,
+    pub mean_w: &'a [f32],
+    pub out: GaLin<'a>,
+}
+
+/// One Zapformer layer over a stream `h` (`[n, dim]`), `r = h` kept aside:
+/// `s = h + ff1_out(silu(ff1_in(h)))`;
+/// `[q, k] = qk(rms(r, in_norm))`, `[v, gate_in, gate_out] = vg(s)`, each a
+/// third or a half of the row, `heads` heads of `head_dim`; q and k rotated
+/// by the frame's angles in neighbour pairs, `v ← v·σ(gate_in)`;
+/// `s += attn_out(softmax(q·kᵀ/√head_dim)·v ⊙ σ(gate_out))` over the whole
+/// segment; `s += conv(s)` and `s += ff2(s)` where present;
+/// `h = rms(r + ¼·(s − r), norm)`, where
+/// `rms(x, w) = x·rsqrt(mean(x²) + 1e-6)·w` a row.
+pub struct GaLayer<'a> {
+    pub ff1_in: GaLin<'a>,
+    pub ff1_out: GaLin<'a>,
+    pub in_norm: &'a [f32],
+    pub qk: GaLin<'a>,
+    pub vg: GaLin<'a>,
+    pub attn_out: GaLin<'a>,
+    pub conv: Option<GaConv<'a>>,
+    pub ff2: Option<(GaLin<'a>, GaLin<'a>)>,
+    pub norm: &'a [f32],
+}
+
+/// One stack: with `fold` 2 its rows are pairs of frames (`[⌈t/2⌉, 2·width]`,
+/// an odd last frame paired with zeros), and the pairs are split back after
+/// it. `h = proj(x)`, `bypass = residual_scales[0]·h`, `h ← input_scale·h`,
+/// after layer i `bypass += residual_scales[i + 1]·h`, and the stack gives
+/// `x + proj_t(bypass)`.
+pub struct GaStack<'a> {
+    pub fold: usize,
+    pub dim: usize,
+    pub heads: usize,
+    pub proj: GaLin<'a>,
+    pub proj_t: GaLin<'a>,
+    pub residual_scales: &'a [f32],
+    pub input_scale: f32,
+    pub layers: Vec<GaLayer<'a>>,
+}
+
+/// The convolutional front end before the stacks, for
+/// [`gigaam_encode_feats`]: three 3×3 convolutions over `[channel][frame][mel]`
+/// (`conv[i]` = weight `[co][ci][3][3]`, bias, `co`) — the first with two
+/// zero frames before the first and one zero bin on both sides, the other two
+/// at stride 2 with one zero frame on both sides and no padding in
+/// frequency — each followed by SiLU; a ConvNeXt block (`dw`: a depthwise
+/// 3×3 padded like the first convolution, then `pw1`, SiLU, `pw2` over the
+/// channels, added to its input); and `out` over each frame's
+/// `[channel][bin]` values laid flat.
+pub struct GaFront<'a> {
+    pub n_mel: usize,
+    pub conv: [(&'a [f32], &'a [f32], usize); 3],
+    pub dw: (&'a [f32], &'a [f32]),
+    pub pw1: GaLin<'a>,
+    pub pw2: GaLin<'a>,
+    pub out: GaLin<'a>,
+}
+
+/// The GigaAM encoder for [`gigaam_encode`]. `cos` / `sin` are
+/// `[position][head_dim / 2]`; after the last stack every row is scaled by
+/// `out_scale / √(mean(x²) + out_eps²)`. `key` names the model for the
+/// device's weight cache.
+pub struct GigaamArgs<'a> {
+    pub key: u64,
+    pub width: usize,
+    pub head_dim: usize,
+    pub stacks: Vec<GaStack<'a>>,
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub out_scale: f32,
+    pub out_eps: f32,
+    pub prof: bool,
+    /// the front end, for a device that runs it too ([`gigaam_encode_feats`])
+    pub front: Option<GaFront<'a>>,
+}
+
+/// One layer of GigaAM's voice-activity Conformer for [`gigaam_vad`], over
+/// rows `r` (`[n, dim]`); a norm is LayerNorm (weight, bias, eps 1e-5):
+/// `r += ½·ff1(norm_ff1(r))` (linear, SiLU, linear);
+/// `xn = norm_att(r)`, queries and keys from `q` / `k` of `xn` rotated by the
+/// step's angles (lane j of a head with lane j + head_dim/2), values from `v`
+/// of `xn` itself, attention inside a window, `r += o(context)`;
+/// `u = pw1(norm_conv(r))` (`[n, 2·dim]`), `g = u[..dim]·σ(u[dim..])`, a
+/// depthwise convolution over time inside the window (`taps` `[kernel][dim]`,
+/// zeros outside), `r += pw2(silu(conv_norm(conv)))`;
+/// `r += ½·ff2(norm_ff2(r))`; `r = norm_out(r)`.
+pub struct GaVadLayer<'a> {
+    pub norm_ff1: (&'a [f32], &'a [f32]),
+    pub ff1: (GaLin<'a>, GaLin<'a>),
+    pub norm_att: (&'a [f32], &'a [f32]),
+    pub q: GaLin<'a>,
+    pub k: GaLin<'a>,
+    pub v: GaLin<'a>,
+    pub o: GaLin<'a>,
+    pub norm_conv: (&'a [f32], &'a [f32]),
+    pub pw1: GaLin<'a>,
+    pub taps: &'a [f32],
+    pub dw_b: &'a [f32],
+    pub conv_norm: (&'a [f32], &'a [f32]),
+    pub pw2: GaLin<'a>,
+    pub norm_ff2: (&'a [f32], &'a [f32]),
+    pub ff2: (GaLin<'a>, GaLin<'a>),
+    pub norm_out: (&'a [f32], &'a [f32]),
+}
+
+/// GigaAM's voice-activity model for [`gigaam_vad`]: two convolutions over
+/// time (kernel 3, stride 2, one zero frame on both sides, ReLU; `pre[i]` =
+/// weight `[out][3][in]`, bias, out, in), the layers, and `head` (one logit
+/// a step). `cos` / `sin` are `[step][head_dim / 2]`.
+pub struct GaVadArgs<'a> {
+    pub key: u64,
+    pub n_mel: usize,
+    pub dim: usize,
+    pub heads: usize,
+    pub kernel: usize,
+    pub pre: [(&'a [f32], &'a [f32], usize, usize); 2],
+    pub layers: Vec<GaVadLayer<'a>>,
+    pub head: GaLin<'a>,
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+}
+
+/// The voice-activity logits of `windows` windows of `frames` mel frames
+/// each, laid back to back in `feats` (`[windows·frames, n_mel]`); every
+/// window is on its own. `out` receives `windows·steps` logits, `steps`
+/// being `frames` halved twice (each time `(l − 1) / 2 + 1`). `false` =
+/// declined: the caller runs the host model.
+#[allow(unused_variables)]
+pub fn gigaam_vad(a: &GaVadArgs, feats: &[f32], windows: usize, frames: usize, out: &mut [f32]) -> bool {
+    if std::env::var("CMF_GIGAAM_RESIDENT").as_deref() == Ok("0") || std::env::var("CMF_GIGAAM_VAD_DEV").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gigaam::vad(a, feats, windows, frames, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::gigaam_vad(a, feats, windows, frames, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// The front end and the encoder stacks of one segment on the device:
+/// `feats` is `[frames, n_mel]` log-mel, `out` (`[⌈⌈frames/2⌉/2⌉, width]`)
+/// receives the encoder output. `false` = declined (a backend without the
+/// front end, or `a.front` unset): the caller runs the front end itself and
+/// calls [`gigaam_encode`].
+#[allow(unused_variables)]
+pub fn gigaam_encode_feats(a: &GigaamArgs, feats: &[f32], frames: usize, out: &mut [f32]) -> bool {
+    if a.front.is_none() || std::env::var("CMF_GIGAAM_RESIDENT").as_deref() == Ok("0") || std::env::var("CMF_GIGAAM_FRONT_DEV").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gigaam::encode_feats(a, feats, frames, out),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::gigaam_encode_feats(a, feats, frames, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// The GigaAM encoder stacks over one segment `x` (`[t, width]`) in place,
+/// the activations on the device from the first stack to the output norm:
+/// one upload, one readback. `false` = declined; the caller runs its own
+/// path. `CMF_GIGAAM_RESIDENT=0` declines.
+#[allow(unused_variables)]
+pub fn gigaam_encode(a: &GigaamArgs, x: &mut [f32], t: usize) -> bool {
+    if std::env::var("CMF_GIGAAM_RESIDENT").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::gigaam::encode(a, x, t),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gigaam::encode(a, x, t),
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::gigaam_encode(a, x, t),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// One SAM block for [`sam_encode`]. `rel` is `[2w−1, hd]` relative positions,
 /// h then w (window blocks; the global ones take `SamArgs::rel_global`).
 pub struct SamLayer<'a> {

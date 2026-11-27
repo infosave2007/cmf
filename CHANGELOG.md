@@ -5,9 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.21] — 2026-11-27
 
 ### Added
+- GigaAM-v4 (ai-sage/GigaAM-v4), speech recognition for Russian and English: `cortiq convert` packs the `rnnt`
+  and `ctc` revisions (`--quant q8_2f | q4tp | f16`; both recognition heads, the mel filter bank and the
+  voice-activity network in one file), `cortiq transcribe` gives the formatted or the plain transcript
+  (`--head e2e | raw | both`), word times (`--timestamps`), JSON (`--json`), and cuts a recording over 30 s by voice
+  activity as the reference package does; `cortiq serve` on such a file answers `POST /v1/audio/transcriptions`
+  in the OpenAI shape (multipart or JSON in; `json`, `text`, `verbose_json`, `srt`, `vtt` out). The encoder runs
+  resident on CUDA, Vulkan and Metal (`gpu::gigaam_encode`), with the convolutional front end and the
+  voice-activity network on the card too on CUDA and Vulkan; the host path multiplies the int8 weights a
+  cache-sized tile at a time through a float GEMM (Accelerate on macOS), and a short batch straight from the
+  int8 rows on AVX2. NVIDIA L4: half an hour of speech in 2.73 s through CUDA (660x real time) and 4.64 s
+  through Vulkan; MacBook Air M4: 10.6 s through Metal, 16.7 s on the CPU. Against the authors' PyTorch code on
+  13 262 clips of Golos and Russian LibriSpeech the 8-bit file has the same word error rate, and the
+  half-precision weights give 13 261 identical transcripts.
 - `cortiq loglik --scorer device`: every request on the CUDA or wgpu (Vulkan) batch graph. The context runs as prompt
   chunks, the continuation rows in 16-row verify windows whose final norm and lm_head run on the card, so only those
   rows' logits come back. `--scorer auto` (the new default) takes it where the backend and the model admit it and
