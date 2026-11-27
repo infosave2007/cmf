@@ -282,42 +282,11 @@ pub(super) fn sumsq(x: &[f32]) -> f32 {
 
 #[inline(always)]
 fn dot_rows_body(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize) {
-    // Every weight row against the input rows four at a time: the weight
-    // chunk is loaded once and feeds four independent sums of eight lanes,
-    // so neither the reduction order nor one sum's latency holds the loop.
+    // every weight row against every input row: sixteen lanes a dot, so the
+    // reduction vectorizes without reassociation flags
     for r in 0..rows {
         let wr = &w[r * cols..(r + 1) * cols];
-        let mut i = 0;
-        while i + 4 <= n {
-            let (x0, x1, x2, x3) = (&x[i * cols..][..cols], &x[(i + 1) * cols..][..cols], &x[(i + 2) * cols..][..cols], &x[(i + 3) * cols..][..cols]);
-            let mut acc = [[0.0f32; 8]; 4];
-            // chunks of eight with no bounds checks inside, so the lanes become one vector each
-            let chunks = wr.chunks_exact(8).zip(x0.chunks_exact(8)).zip(x1.chunks_exact(8)).zip(x2.chunks_exact(8)).zip(x3.chunks_exact(8));
-            for ((((wv, a), b), c), d) in chunks {
-                for l in 0..8 {
-                    acc[0][l] += wv[l] * a[l];
-                    acc[1][l] += wv[l] * b[l];
-                    acc[2][l] += wv[l] * c[l];
-                    acc[3][l] += wv[l] * d[l];
-                }
-            }
-            let mut s = [0.0f32; 4];
-            for (s, a) in s.iter_mut().zip(&acc) {
-                *s = a.iter().sum();
-            }
-            for c in cols - cols % 8..cols {
-                let wv = wr[c];
-                s[0] += wv * x0[c];
-                s[1] += wv * x1[c];
-                s[2] += wv * x2[c];
-                s[3] += wv * x3[c];
-            }
-            for (k, v) in s.iter().enumerate() {
-                y[(i + k) * rows + r] = *v;
-            }
-            i += 4;
-        }
-        while i < n {
+        for i in 0..n {
             let xi = &x[i * cols..(i + 1) * cols];
             let (mut a0, mut a1) = ([0.0f32; 8], [0.0f32; 8]);
             let mut wc = wr.chunks_exact(16);
@@ -336,16 +305,94 @@ fn dot_rows_body(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], row
                 s += wv * xv;
             }
             y[i * rows + r] = s;
-            i += 1;
         }
     }
 }
-simd_fn!(
-    /// `y[n, rows] = x[n, cols] · w[rows, cols]ᵀ` for a handful of input rows:
-    /// plain dot products, no packing (a GEMM would spend its time packing
-    /// the weight for so few rows).
-    dot_rows, dot_rows_body, (w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize)
-);
+
+/// The same on AVX2 + FMA, written out: a weight chunk is loaded once and
+/// feeds eight (or four, or one) input rows, each with its own sum, so the
+/// loop runs at the two multiply-adds a cycle the core has instead of
+/// waiting on one sum's latency.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_rows_avx2(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize) {
+    use std::arch::x86_64::*;
+    assert!(w.len() >= rows * cols && x.len() >= n * cols && y.len() >= n * rows);
+    #[inline(always)]
+    unsafe fn hsum(v: __m256) -> f32 {
+        unsafe {
+            let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+            let s = _mm_hadd_ps(s, s);
+            _mm_cvtss_f32(_mm_hadd_ps(s, s))
+        }
+    }
+    let c8 = cols / 8 * 8;
+    // SAFETY: every pointer stays inside the slices asserted above.
+    unsafe {
+        let xp = x.as_ptr();
+        for r in 0..rows {
+            let wr = w.as_ptr().add(r * cols);
+            let mut i = 0;
+            // a group of G input rows against this weight row
+            macro_rules! group {
+                ($g:expr) => {
+                    while i + $g <= n {
+                        let mut acc = [_mm256_setzero_ps(); $g];
+                        let mut c = 0;
+                        while c < c8 {
+                            let wv = _mm256_loadu_ps(wr.add(c));
+                            for k in 0..$g {
+                                acc[k] = _mm256_fmadd_ps(wv, _mm256_loadu_ps(xp.add((i + k) * cols + c)), acc[k]);
+                            }
+                            c += 8;
+                        }
+                        for k in 0..$g {
+                            let mut s = hsum(acc[k]);
+                            for c in c8..cols {
+                                s += *wr.add(c) * *xp.add((i + k) * cols + c);
+                            }
+                            *y.get_unchecked_mut((i + k) * rows + r) = s;
+                        }
+                        i += $g;
+                    }
+                };
+            }
+            group!(8);
+            group!(4);
+            // what is left, a row at a time on four sums
+            while i < n {
+                let xi = xp.add(i * cols);
+                let mut acc = [_mm256_setzero_ps(); 4];
+                let c32 = cols / 32 * 32;
+                let mut c = 0;
+                while c < c32 {
+                    for k in 0..4 {
+                        acc[k] = _mm256_fmadd_ps(_mm256_loadu_ps(wr.add(c + 8 * k)), _mm256_loadu_ps(xi.add(c + 8 * k)), acc[k]);
+                    }
+                    c += 32;
+                }
+                let mut s = hsum(_mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3])));
+                for c in c32..cols {
+                    s += *wr.add(c) * *xi.add(c);
+                }
+                *y.get_unchecked_mut(i * rows + r) = s;
+                i += 1;
+            }
+        }
+    }
+}
+
+/// `y[n, rows] = x[n, cols] · w[rows, cols]ᵀ` for a handful of input rows:
+/// plain dot products, no packing (a GEMM would spend its time packing the
+/// weight for so few rows).
+pub(super) fn dot_rows(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], rows: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected.
+        return unsafe { dot_rows_avx2(w, cols, x, n, y, rows) };
+    }
+    dot_rows_body(w, cols, x, n, y, rows)
+}
 
 /// [`dot_rows`] with the weight rows spread over the pool (the output is
 /// written a column range a worker).
@@ -792,15 +839,19 @@ mod tests {
 
     #[test]
     fn dot_rows_matches_the_float_product() {
-        let (rows, cols, n) = (9usize, 37usize, 7usize);
-        let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.13).collect();
-        let x: Vec<f32> = (0..n * cols).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.3).collect();
-        let mut y = vec![0f32; n * rows];
-        dot_rows(&w, cols, &x, n, &mut y, rows);
-        for i in 0..n {
-            for r in 0..rows {
-                let want: f64 = (0..cols).map(|c| x[i * cols + c] as f64 * w[r * cols + c] as f64).sum();
-                assert!((y[i * rows + r] as f64 - want).abs() < 1e-4);
+        // 13 input rows: a group of eight, one of four, one alone; widths with and without a tail
+        for (rows, cols, n) in [(9usize, 37usize, 13usize), (5, 64, 8), (3, 320, 1), (4, 7, 5)] {
+            let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 11 % 19) as f32 - 9.0) * 0.13).collect();
+            let x: Vec<f32> = (0..n * cols).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.3).collect();
+            let (mut y, mut y_plain) = (vec![0f32; n * rows], vec![0f32; n * rows]);
+            dot_rows(&w, cols, &x, n, &mut y, rows);
+            dot_rows_body(&w, cols, &x, n, &mut y_plain, rows);
+            for i in 0..n {
+                for r in 0..rows {
+                    let want: f64 = (0..cols).map(|c| x[i * cols + c] as f64 * w[r * cols + c] as f64).sum();
+                    assert!((y[i * rows + r] as f64 - want).abs() < 1e-3, "{rows}x{cols} n={n}");
+                    assert!((y_plain[i * rows + r] as f64 - want).abs() < 1e-3, "{rows}x{cols} n={n}");
+                }
             }
         }
     }
