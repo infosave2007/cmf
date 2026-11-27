@@ -389,7 +389,10 @@ mod tests {
             segments: Vec::new(),
         };
         let data: Vec<u8> = [1f32, 0.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dir = std::env::temp_dir().join(format!("cortiq-gigaam-decode-{}", std::process::id()));
+        // a directory of this call's own: the tests of this module run side by side
+        static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cortiq-gigaam-decode-{}-{call}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tiny.cmf");
         CmfModel::write(&path, &header, &[TensorSpec { name: "w".into(), dtype: TensorDtype::F32, shape: vec![2, 2], data }], None, None).unwrap();
@@ -401,8 +404,6 @@ mod tests {
     #[test]
     fn ctc_collapses_repeats_and_blanks() {
         // identity "logits": the encoder row is the class score; blank is class 2 of 3
-        use cortiq_core::format::{CmfHeader, TensorSpec};
-        let _ = (std::marker::PhantomData::<CmfHeader>, std::marker::PhantomData::<TensorSpec>);
         let model = Arc::new(tiny_model());
         let lin = Lin::load_named(&model, "w", None).unwrap();
         let head = Head { kind: Kind::Ctc(lin), vocab: Vocab::Chars(vec!["a".into()]), blank: 1 };
