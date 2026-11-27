@@ -909,7 +909,7 @@ mod tests {
             }
             stacks.push(GaStack { fold, dim: d, heads: nh, proj, proj_t, residual_scales: &scales[si], input_scale: 0.7, layers: ls });
         }
-        let args = GigaamArgs { key: 0x6a61_7465_7374, width: w, head_dim: hd, stacks, cos: &cos, sin: &sin, out_scale: 1.3, out_eps: 0.05, prof: false };
+        let args = GigaamArgs { key: 0x6a61_7465_7374, width: w, head_dim: hd, stacks, cos: &cos, sin: &sin, out_scale: 1.3, out_eps: 0.05, prof: false, front: None };
         let mut st3 = 0x0f1e_2d3c_4b5a_6978u64;
         // the first call fills the planes behind the forward, the others find them
         for t in [37usize, 70, 1, 64] {
