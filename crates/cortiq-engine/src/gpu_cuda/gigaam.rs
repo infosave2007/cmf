@@ -7,7 +7,7 @@
 //! everything else the kernels of `gigaam.cu`.
 
 use super::*;
-use crate::gpu::{GaLin, GigaamArgs};
+use crate::gpu::{GaFront, GaLin, GigaamArgs};
 use std::sync::Mutex;
 
 const GA_SRC: &str = include_str!("gigaam.cu");
@@ -24,6 +24,8 @@ struct GaFuncs {
     gate: cs::CUfunction,
     mean: cs::CUfunction,
     conv: cs::CUfunction,
+    conv2d: cs::CUfunction,
+    flat: cs::CUfunction,
 }
 
 /// A product on the card: the weight plane and its bias (None: no bias).
@@ -60,9 +62,35 @@ struct StackDev {
     layers: Vec<LayerDev>,
 }
 
+/// The front end on the card: the three convolutions (weight, bias, channels
+/// out), the depthwise one, the two pointwise ones as convolutions, the projection.
+struct FrontDev {
+    conv: Vec<(Buf, Buf, usize)>,
+    dw: (Buf, Buf),
+    pw1: LinDev,
+    pw2: LinDev,
+    out: LinDev,
+}
+
+fn up_front(fr: &GaFront) -> Res<FrontDev> {
+    let mut scratch = Vec::new();
+    let mut conv = Vec::with_capacity(3);
+    for (w, b, co) in &fr.conv {
+        conv.push((Buf::from_slice(w)?, Buf::from_slice(b)?, *co));
+    }
+    Ok(FrontDev {
+        conv,
+        dw: (Buf::from_slice(fr.dw.0)?, Buf::from_slice(fr.dw.1)?),
+        pw1: up_lin(&fr.pw1, &mut scratch)?,
+        pw2: up_lin(&fr.pw2, &mut scratch)?,
+        out: up_lin(&fr.out, &mut scratch)?,
+    })
+}
+
 struct GaState {
     f: Option<GaFuncs>,
     model: Option<(u64, Vec<StackDev>, Buf, Buf)>,
+    front: Option<(u64, FrontDev)>,
     /// working buffers by name; they only grow
     work: Option<std::collections::HashMap<&'static str, Buf>>,
 }
@@ -86,7 +114,7 @@ fn work(c: &Ctx, bufs: &mut std::collections::HashMap<&'static str, Buf>, name: 
 // SAFETY: the functions and allocations are used under the context's state lock.
 unsafe impl Send for GaState {}
 
-static STATE: Mutex<GaState> = Mutex::new(GaState { f: None, model: None, work: None });
+static STATE: Mutex<GaState> = Mutex::new(GaState { f: None, model: None, front: None, work: None });
 
 fn funcs(c: &Ctx, s: &mut GaState) -> Res<GaFuncs> {
     if let Some(f) = s.f {
@@ -104,6 +132,8 @@ fn funcs(c: &Ctx, s: &mut GaState) -> Res<GaFuncs> {
         gate: func(m, "ga_gate")?,
         mean: func(m, "ga_mean")?,
         conv: func(m, "ga_conv")?,
+        conv2d: func(m, "ga_conv2d")?,
+        flat: func(m, "ga_flat")?,
     };
     s.f = Some(f);
     Ok(f)
@@ -212,7 +242,7 @@ pub fn gigaam_encode(a: &GigaamArgs, x: &mut [f32], t: usize) -> bool {
     }
     let _st = c.st.lock().unwrap();
     let mut s = STATE.lock().unwrap();
-    match unsafe { run(c, &mut s, a, x, t) } {
+    match unsafe { run(c, &mut s, a, x, t, None) } {
         Ok(()) => true,
         Err(e) => {
             let _ = c.sync();
@@ -222,7 +252,63 @@ pub fn gigaam_encode(a: &GigaamArgs, x: &mut [f32], t: usize) -> bool {
     }
 }
 
-unsafe fn run(c: &Ctx, s: &mut GaState, a: &GigaamArgs, x: &mut [f32], t: usize) -> Res<()> {
+/// The front end and the stacks: `feats` (`[frames, n_mel]`) in, `out`
+/// (`[t, width]`) the encoder output; `false` = declined.
+pub fn gigaam_encode_feats(a: &GigaamArgs, feats: &[f32], frames: usize, out: &mut [f32]) -> bool {
+    let Some(c) = ctx() else { return false };
+    if c.current().is_err() || a.front.is_none() {
+        return false;
+    }
+    let t = frames.div_ceil(2).div_ceil(2);
+    let _st = c.st.lock().unwrap();
+    let mut s = STATE.lock().unwrap();
+    match unsafe { run(c, &mut s, a, out, t, Some((feats, frames))) } {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = c.sync();
+            decline("gigaam front end", &e);
+            false
+        }
+    }
+}
+
+/// The front end over `feats` into the working buffer `x` (`[t, width]`).
+unsafe fn front_run(c: &Ctx, f: GaFuncs, ops: &Ops, fr: &GaFront, dev: &FrontDev, bufs: &mut std::collections::HashMap<&'static str, Buf>, feats: &[f32], frames: usize, xb: u64) -> Res<usize> {
+    let n_mel = fr.n_mel;
+    if frames == 0 || feats.len() != frames * n_mel || dev.conv.len() != 3 {
+        return Err("a front-end shape outside the kernels".into());
+    }
+    // sizes after each convolution: (channels, frames, bins)
+    let s1 = (dev.conv[0].2, frames, n_mel);
+    let s2 = (dev.conv[1].2, frames.div_ceil(2), (n_mel - 3) / 2 + 1);
+    let s3 = (dev.conv[2].2, s2.1.div_ceil(2), (s2.2 - 3) / 2 + 1);
+    let vol = |s: (usize, usize, usize)| s.0 * s.1 * s.2 * 4;
+    let fin = work(c, bufs, "f_in", frames * n_mel * 4)?;
+    let (a1, a2, a3, a4) = (work(c, bufs, "f_1", vol(s1))?, work(c, bufs, "f_2", vol(s2))?, work(c, bufs, "f_3", vol(s3))?, work(c, bufs, "f_4", vol(s3))?);
+    let up = work(c, bufs, "f_up", dev.pw1.rows * s3.1 * s3.2 * 4)?;
+    let conv = |x: u64, w: u64, b: u64, add: u64, y: u64, i: (usize, usize, usize), o: (usize, usize, usize), k: i32, st: i32, pt: i32, pf: i32, dw: i32, act: i32, has_add: i32| -> Res<()> {
+        let (ci, t_i, f_i, co, to, fo) = (i.0 as i32, i.1 as i32, i.2 as i32, o.0 as i32, o.1 as i32, o.2 as i32);
+        unsafe { c.launch(f.conv2d, blocks(o.0 * o.1 * o.2), 256, 0, kargs!(x, w, b, add, y, ci, co, t_i, f_i, to, fo, k, st, pt, pf, dw, act, has_add)) }
+    };
+    unsafe {
+        cu::memcpy_htod_async(fin, feats, c.stream).map_err(derr)?;
+        conv(fin, dev.conv[0].0.ptr, dev.conv[0].1.ptr, fin, a1, (1, frames, n_mel), s1, 3, 1, 2, 1, 0, 1, 0)?;
+        conv(a1, dev.conv[1].0.ptr, dev.conv[1].1.ptr, a1, a2, s1, s2, 3, 2, 1, 0, 0, 1, 0)?;
+        conv(a2, dev.conv[2].0.ptr, dev.conv[2].1.ptr, a2, a3, s2, s3, 3, 2, 1, 0, 0, 1, 0)?;
+        // ConvNeXt: depthwise 3×3, 1×1 up with SiLU, 1×1 down added to the block input
+        conv(a3, dev.dw.0.ptr, dev.dw.1.ptr, a3, a4, s3, s3, 3, 1, 2, 1, 1, 0, 0)?;
+        let up_b = dev.pw1.b.as_ref().ok_or("the front end's pointwise convolutions carry a bias")?;
+        let dn_b = dev.pw2.b.as_ref().ok_or("the front end's pointwise convolutions carry a bias")?;
+        conv(a4, dev.pw1.w.ptr, up_b.ptr, a4, up, s3, (dev.pw1.rows, s3.1, s3.2), 1, 1, 0, 0, 0, 1, 0)?;
+        conv(up, dev.pw2.w.ptr, dn_b.ptr, a3, a4, (dev.pw1.rows, s3.1, s3.2), s3, 1, 1, 0, 0, 0, 0, 1)?;
+        let (c_i, t_i, f_i) = (s3.0 as i32, s3.1 as i32, s3.2 as i32);
+        c.launch(f.flat, blocks(s3.0 * s3.1 * s3.2), 256, 0, kargs!(a4, a3, c_i, t_i, f_i))?;
+        ops.lin(&dev.out, a3, xb, s3.1, 0)?;
+    }
+    Ok(s3.1)
+}
+
+unsafe fn run(c: &Ctx, s: &mut GaState, a: &GigaamArgs, x: &mut [f32], t: usize, feats: Option<(&[f32], usize)>) -> Res<()> {
     let (w, hd) = (a.width, a.head_dim);
     if t == 0 || x.len() != t * w || hd % 2 != 0 || a.cos.len() < t * hd / 2 || a.sin.len() != a.cos.len() {
         return Err("an encoder shape outside the kernels".into());
@@ -236,7 +322,13 @@ unsafe fn run(c: &Ctx, s: &mut GaState, a: &GigaamArgs, x: &mut [f32], t: usize)
         let (stacks, cos, sin) = upload(a)?;
         s.model = Some((a.key, stacks, cos, sin));
     }
-    let GaState { model, work: bufs, .. } = s;
+    if let (Some(fr), true) = (&a.front, feats.is_some()) {
+        if s.front.as_ref().is_none_or(|m| m.0 != a.key) {
+            s.front = None;
+            s.front = Some((a.key, up_front(fr)?));
+        }
+    }
+    let GaState { model, work: bufs, front: front_dev, .. } = s;
     let (_, stacks, cos, sin) = model.as_ref().expect("set above");
     let bufs = bufs.get_or_insert_with(Default::default);
     let mode = if super::super::prec().1 == Gemm::F32 { Gemm::F32 } else { Gemm::Tf32 };
@@ -266,9 +358,16 @@ unsafe fn run(c: &Ctx, s: &mut GaState, a: &GigaamArgs, x: &mut [f32], t: usize)
     let mean = b("mean", max_dim * 4)?;
     let out_w = b("out_w", 64)?;
     let out_scale = [a.out_scale];
-    unsafe {
-        cu::memcpy_htod_async(xb, &*x, c.stream).map_err(derr)?;
-        cu::memcpy_htod_async(out_w, &out_scale, c.stream).map_err(derr)?;
+    unsafe { cu::memcpy_htod_async(out_w, &out_scale, c.stream).map_err(derr)? };
+    match (feats, &a.front, front_dev.as_ref()) {
+        (Some((fe, frames)), Some(fr), Some((_, dev))) => {
+            let got = unsafe { front_run(c, f, &ops, fr, dev, bufs, fe, frames, xb)? };
+            if got != t {
+                return Err(format!("the front end gave {got} frames for {t}"));
+            }
+        }
+        (Some(_), _, _) => return Err("no front end on the card".into()),
+        (None, _, _) => unsafe { cu::memcpy_htod_async(xb, &*x, c.stream).map_err(derr)? },
     }
     let scale = (hd as f32).powf(-0.5);
     for (st, dev) in a.stacks.iter().zip(stacks) {

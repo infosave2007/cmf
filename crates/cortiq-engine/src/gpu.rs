@@ -5632,6 +5632,24 @@ pub struct GaStack<'a> {
     pub layers: Vec<GaLayer<'a>>,
 }
 
+/// The convolutional front end before the stacks, for
+/// [`gigaam_encode_feats`]: three 3×3 convolutions over `[channel][frame][mel]`
+/// (`conv[i]` = weight `[co][ci][3][3]`, bias, `co`) — the first with two
+/// zero frames before the first and one zero bin on both sides, the other two
+/// at stride 2 with one zero frame on both sides and no padding in
+/// frequency — each followed by SiLU; a ConvNeXt block (`dw`: a depthwise
+/// 3×3 padded like the first convolution, then `pw1`, SiLU, `pw2` over the
+/// channels, added to its input); and `out` over each frame's
+/// `[channel][bin]` values laid flat.
+pub struct GaFront<'a> {
+    pub n_mel: usize,
+    pub conv: [(&'a [f32], &'a [f32], usize); 3],
+    pub dw: (&'a [f32], &'a [f32]),
+    pub pw1: GaLin<'a>,
+    pub pw2: GaLin<'a>,
+    pub out: GaLin<'a>,
+}
+
 /// The GigaAM encoder for [`gigaam_encode`]. `cos` / `sin` are
 /// `[position][head_dim / 2]`; after the last stack every row is scaled by
 /// `out_scale / √(mean(x²) + out_eps²)`. `key` names the model for the
@@ -5646,6 +5664,26 @@ pub struct GigaamArgs<'a> {
     pub out_scale: f32,
     pub out_eps: f32,
     pub prof: bool,
+    /// the front end, for a device that runs it too ([`gigaam_encode_feats`])
+    pub front: Option<GaFront<'a>>,
+}
+
+/// The front end and the encoder stacks of one segment on the device:
+/// `feats` is `[frames, n_mel]` log-mel, `out` (`[⌈⌈frames/2⌉/2⌉, width]`)
+/// receives the encoder output. `false` = declined (a backend without the
+/// front end, or `a.front` unset): the caller runs the front end itself and
+/// calls [`gigaam_encode`].
+#[allow(unused_variables)]
+pub fn gigaam_encode_feats(a: &GigaamArgs, feats: &[f32], frames: usize, out: &mut [f32]) -> bool {
+    if a.front.is_none() || std::env::var("CMF_GIGAAM_RESIDENT").as_deref() == Ok("0") || std::env::var("CMF_GIGAAM_FRONT_DEV").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "cuda")]
+        Backend::Cuda => crate::gpu_cuda::gigaam_encode_feats(a, feats, frames, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
 }
 
 /// The GigaAM encoder stacks over one segment `x` (`[t, width]`) in place,

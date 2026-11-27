@@ -416,6 +416,12 @@ impl Embed {
         })
     }
 
+    /// The front end for a device that runs it itself.
+    fn ga(&self, n_mel: usize) -> crate::gpu::GaFront<'_> {
+        let c = |i: usize| (self.conv[i].0.as_slice(), self.conv[i].1.as_slice(), self.conv[i].2);
+        crate::gpu::GaFront { n_mel, conv: [c(0), c(1), c(2)], dw: (&self.dw.0, &self.dw.1), pw1: self.pw1.ga(), pw2: self.pw2.ga(), out: self.out.ga() }
+    }
+
     /// Encoder frames for `frames` mel frames.
     fn out_frames(frames: usize) -> usize {
         frames.div_ceil(2).div_ceil(2)
@@ -956,7 +962,7 @@ impl Encoder {
                     .collect(),
             })
             .collect();
-        GigaamArgs { key: self.key, width: self.width, head_dim: QDIM, stacks, cos: &self.rope.cos, sin: &self.rope.sin, out_scale: self.out_scale, out_eps: self.out_eps, prof }
+        GigaamArgs { key: self.key, width: self.width, head_dim: QDIM, stacks, cos: &self.rope.cos, sin: &self.rope.sin, out_scale: self.out_scale, out_eps: self.out_eps, prof, front: None }
     }
 
     /// The whole encoder on the device, a segment at a time; `None` when it declines.
@@ -1119,6 +1125,8 @@ pub struct Transcriber {
     e2e: decode::Head,
     raw: decode::Head,
     vad: Option<vad::Vad>,
+    /// the device declined the front end: the host runs it
+    front_dev_off: std::sync::atomic::AtomicBool,
     /// `rnnt` or `ctc`
     pub revision: String,
 }
@@ -1149,6 +1157,7 @@ impl Transcriber {
             e2e: head("e2e")?,
             raw: head("raw")?,
             vad,
+            front_dev_off: Default::default(),
             revision: meta.get("revision").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         })
     }
@@ -1193,6 +1202,43 @@ impl Transcriber {
         (rows, segs)
     }
 
+    /// Features on the host, the front end and the stacks on the device, a
+    /// segment at a time: the encoder rows of the batch and its frame counts,
+    /// with the seconds spent on features and on the device. `None` when the
+    /// device has no such path (nothing was computed that the host path
+    /// would not compute again).
+    fn encode_on_device(&self, segments: &[&[f32]], ex: &Exec) -> Option<(Vec<f32>, Vec<usize>, f64, f64)> {
+        use std::sync::atomic::Ordering;
+        if !ex.resident || self.encoder.resident_off.load(Ordering::Relaxed) || self.front_dev_off.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut args = self.encoder.ga_args(ex.prof);
+        args.front = Some(self.embed.ga(self.mel.n_mel()));
+        let w = self.encoder.width;
+        let (mut rows, mut segs) = (Vec::new(), Vec::with_capacity(segments.len()));
+        let (mut feat_s, mut enc_s) = (0.0, 0.0);
+        for s in segments {
+            let frames = Mel::frames(s.len());
+            let t = Embed::out_frames(frames);
+            segs.push(t);
+            if t == 0 {
+                continue;
+            }
+            let t0 = Instant::now();
+            let feats = self.mel.features(s, ex.pool);
+            feat_s += t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            let at = rows.len();
+            rows.resize(at + t * w, 0.0);
+            if !crate::gpu::gigaam_encode_feats(&args, &feats, frames, &mut rows[at..]) {
+                self.front_dev_off.store(true, Ordering::Relaxed);
+                return None;
+            }
+            enc_s += t1.elapsed().as_secs_f64();
+        }
+        Some((rows, segs, feat_s, enc_s))
+    }
+
     /// Transcribe mono 16 kHz samples.
     pub fn transcribe(&self, samples: &[f32], opts: &Options, pool: Option<&Pool>) -> Result<Output, String> {
         let mut out = Output { audio_s: samples.len() as f64 / SR as f64, ..Default::default() };
@@ -1230,13 +1276,23 @@ impl Transcriber {
                 frames += Embed::out_frames(Mel::frames(clips[j].len()));
                 j += 1;
             }
-            let t1 = Instant::now();
-            let (x, segs) = self.front(&clips[i..j], &ex);
-            out.features_s += t1.elapsed().as_secs_f64();
-            let t2 = Instant::now();
-            let live: Vec<usize> = segs.iter().copied().filter(|t| *t > 0).collect();
-            let enc = if live.is_empty() { Vec::new() } else { self.encoder.forward(x, &live, &ex) };
-            out.encoder_s += t2.elapsed().as_secs_f64();
+            let (enc, segs) = match self.encode_on_device(&clips[i..j], &ex) {
+                Some((enc, segs, feat_s, enc_s)) => {
+                    out.features_s += feat_s;
+                    out.encoder_s += enc_s;
+                    (enc, segs)
+                }
+                None => {
+                    let t1 = Instant::now();
+                    let (x, segs) = self.front(&clips[i..j], &ex);
+                    out.features_s += t1.elapsed().as_secs_f64();
+                    let t2 = Instant::now();
+                    let live: Vec<usize> = segs.iter().copied().filter(|t| *t > 0).collect();
+                    let enc = if live.is_empty() { Vec::new() } else { self.encoder.forward(x, &live, &ex) };
+                    out.encoder_s += t2.elapsed().as_secs_f64();
+                    (enc, segs)
+                }
+            };
             let t3 = Instant::now();
             // every (segment, head) decodes on its own: spread them over the pool
             let mut jobs: Vec<(usize, usize, &decode::Head)> = Vec::new();

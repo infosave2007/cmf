@@ -182,3 +182,43 @@ extern "C" __global__ void ga_conv(const float* __restrict__ cg, const float* __
     const float v = (acc + mean[c]) * sigm(cg[(size_t)row * 2 * d + d + c]);
     z[i] = v * sigm(v);
 }
+
+// A k x k convolution (k 1 or 3) over [ci][t][f] into [co][to][fo]: `pt`
+// zero frames before the first, `pf` zero bins on both sides, stride `st` on
+// both axes; w is [co][ci][k][k]. `groups` 1: dense; otherwise depthwise
+// (ci == co, w [co][1][k][k]). act 1: SiLU after the bias. `add`: the result
+// is added to it (the same shape) instead of stored alone.
+extern "C" __global__ void ga_conv2d(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b,
+                                     const float* __restrict__ add, float* __restrict__ y, int ci, int co, int t, int f, int to,
+                                     int fo, int k, int st, int pt, int pf, int depthwise, int act, int has_add)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (unsigned long long)co * to * fo) return;
+    const int ff = (int)(i % fo), tt = (int)((i / fo) % to), c = (int)(i / ((unsigned long long)fo * to));
+    float acc = b[c];
+    const int c0 = depthwise ? c : 0, c1 = depthwise ? c + 1 : ci;
+    for (int cc = c0; cc < c1; cc++) {
+        const float* wk = w + ((size_t)c * (depthwise ? 1 : ci) + (depthwise ? 0 : cc)) * k * k;
+        const float* xc = x + (size_t)cc * t * f;
+        for (int kt = 0; kt < k; kt++) {
+            const int s_t = tt * st + kt - pt;
+            if (s_t < 0 || s_t >= t) continue;
+            for (int kf = 0; kf < k; kf++) {
+                const int s_f = ff * st + kf - pf;
+                if (s_f < 0 || s_f >= f) continue;
+                acc = fmaf(wk[kt * k + kf], xc[(size_t)s_t * f + s_f], acc);
+            }
+        }
+    }
+    if (act == 1) acc = acc * sigm(acc);
+    y[i] = has_add ? add[i] + acc : acc;
+}
+
+// [c][t][f] to rows [t][c f] (a frame's channels laid flat for the projection).
+extern "C" __global__ void ga_flat(const float* __restrict__ x, float* __restrict__ y, int c, int t, int f)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (unsigned long long)c * t * f) return;
+    const int ff = (int)(i % f), cc = (int)((i / f) % c), tt = (int)(i / ((unsigned long long)f * c));
+    y[i] = x[((size_t)cc * t + tt) * f + ff];
+}
