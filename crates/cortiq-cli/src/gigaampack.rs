@@ -398,8 +398,9 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         "linear_num_key_heads": 0,
         "linear_num_value_heads": 0,
     }))?;
+    // the upstream repository and revision, never the local path: the same checkpoint packs to the same bytes anywhere
     let provenance = serde_json::json!({
-        "source": dir.display().to_string(),
+        "source": format!("ai-sage/GigaAM-v4@{kind}"),
         "base_model": "ai-sage/GigaAM-v4",
         "quant": profile_name(profile),
         "gigaam": {

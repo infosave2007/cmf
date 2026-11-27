@@ -12204,6 +12204,9 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
         "  Tokenizer:   {}",
         if model.vocab.is_some() {
             "embedded"
+        } else if cortiq_engine::gigaam::is_gigaam(&model) {
+            // the heads' units (characters or SentencePiece pieces) ride in the header
+            "embedded (recognition units in the header)"
         } else {
             "sidecar required"
         }
