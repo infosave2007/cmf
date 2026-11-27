@@ -291,28 +291,26 @@ fn dot_rows_body(w: &[f32], cols: usize, x: &[f32], n: usize, y: &mut [f32], row
         while i + 4 <= n {
             let (x0, x1, x2, x3) = (&x[i * cols..][..cols], &x[(i + 1) * cols..][..cols], &x[(i + 2) * cols..][..cols], &x[(i + 3) * cols..][..cols]);
             let mut acc = [[0.0f32; 8]; 4];
-            let mut c = 0;
-            while c + 8 <= cols {
+            // chunks of eight with no bounds checks inside, so the lanes become one vector each
+            let chunks = wr.chunks_exact(8).zip(x0.chunks_exact(8)).zip(x1.chunks_exact(8)).zip(x2.chunks_exact(8)).zip(x3.chunks_exact(8));
+            for ((((wv, a), b), c), d) in chunks {
                 for l in 0..8 {
-                    let wv = wr[c + l];
-                    acc[0][l] += wv * x0[c + l];
-                    acc[1][l] += wv * x1[c + l];
-                    acc[2][l] += wv * x2[c + l];
-                    acc[3][l] += wv * x3[c + l];
+                    acc[0][l] += wv[l] * a[l];
+                    acc[1][l] += wv[l] * b[l];
+                    acc[2][l] += wv[l] * c[l];
+                    acc[3][l] += wv[l] * d[l];
                 }
-                c += 8;
             }
             let mut s = [0.0f32; 4];
             for (s, a) in s.iter_mut().zip(&acc) {
                 *s = a.iter().sum();
             }
-            while c < cols {
+            for c in cols - cols % 8..cols {
                 let wv = wr[c];
                 s[0] += wv * x0[c];
                 s[1] += wv * x1[c];
                 s[2] += wv * x2[c];
                 s[3] += wv * x3[c];
-                c += 1;
             }
             for (k, v) in s.iter().enumerate() {
                 y[(i + k) * rows + r] = *v;
