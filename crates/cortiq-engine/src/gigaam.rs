@@ -1314,14 +1314,13 @@ impl Transcriber {
                 }
             }
             let results: Vec<std::sync::Mutex<Option<decode::Decoded>>> = jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
-            // many jobs: one a worker; a few: one after another, the workers inside each job's products
-            let workers = pool.map_or(1, |p| p.n_workers() + 1);
-            let spread = jobs.len() * 2 >= workers;
-            ops::par(if spread { pool } else { None }, jobs.len(), 2, &|a, b| {
+            // one job a worker; inside a job the products are a thread's own (a segment's greedy search is a
+            // few hundred small products: handing each to the pool costs more than it saves)
+            ops::par(pool, jobs.len(), 2, &|a, b| {
                 for q in a..b {
                     let (k, _, head) = jobs[q];
                     let rows = &enc[starts[k] * w..(starts[k] + segs[k]) * w];
-                    *results[q].lock().unwrap() = Some(head.decode(rows, segs[k], w, if spread { None } else { pool }));
+                    *results[q].lock().unwrap() = Some(head.decode(rows, segs[k], w, None));
                 }
             });
             for (q, (k, which, head)) in jobs.iter().enumerate() {
