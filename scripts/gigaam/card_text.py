@@ -140,17 +140,17 @@ TXT = {
     "en": {
         "rec": "recording", "time": "time, s", "x": "× real time", "vram_gb": "peak card memory, GB", "rss_gb": "peak process memory, GB",
         "file": "file", "same": "transcripts identical to the reference", "ref_row": "reference: the authors' PyTorch code, float32",
-        "f16_row": "CMF, the released half-precision weights (not uploaded)",
+        "f16_row": "CMF, the released half-precision weights, float32 products (not uploaded)",
     },
     "ru": {
         "rec": "запись", "time": "время, с", "x": "× реального времени", "vram_gb": "пик памяти карты, ГБ", "rss_gb": "пик памяти процесса, ГБ",
         "file": "файл", "same": "транскрипты, совпавшие с эталоном", "ref_row": "эталон: код авторов на PyTorch, float32",
-        "f16_row": "CMF, исходные веса половинной точности (не выложен)",
+        "f16_row": "CMF, исходные веса половинной точности, float32-произведения (не выложен)",
     },
     "zh": {
         "rec": "录音", "time": "耗时，秒", "x": "倍实时", "vram_gb": "显存峰值，GB", "rss_gb": "进程内存峰值，GB",
         "file": "文件", "same": "与参考实现完全一致的转写", "ref_row": "参考：作者的 PyTorch 代码，float32",
-        "f16_row": "CMF，原始半精度权重（未上传）",
+        "f16_row": "CMF，原始半精度权重，float32 乘法（未上传）",
     },
 }
 
@@ -175,6 +175,19 @@ def pick(stand, tag, *lens):
         if (stand, tag, s) in F:
             return s, F[(stand, tag, s)]
     return None, None
+
+
+def q4_note(lang):
+    """Why no four-bit file: the measured cost of plain four-bit rounding, when it was measured."""
+    q4, ref = w("rnnt", "ruls", "e2e", "q4tp"), w("rnnt", "ruls", "e2e", "reference")
+    if not q4 or not ref or any(t.endswith("q4tp") for t in TAGS):
+        return ""
+    a, b = n(lang, q4["wer"], 2), n(lang, ref["wer"], 2)
+    return {
+        "en": f" A 4-bit file is not published: 4-bit rounding without retraining costs accuracy (RNN-T on Russian LibriSpeech: {a} % against {b} %).",
+        "ru": f" 4-битный файл не выложен: 4-битное округление без дообучения стоит точности (RNN-T на Russian LibriSpeech: {a} % против {b} %).",
+        "zh": f" 未发布 4 位文件：不经再训练的 4 位量化会损失准确率（RNN-T 在 Russian LibriSpeech 上为 {a} %，参考为 {b} %）。",
+    }[lang]
 
 
 def emit(lang):
@@ -261,7 +274,7 @@ def emit(lang):
         P("alike). RNN-T is the more accurate of the two and the upstream default; CTC decodes in one pass and is the")
         P("faster one. Every file holds both heads, the mel front end's filter bank and the voice-activity network.")
         P("Not here: the `ssl` revision (an encoder without a recognition head) and the streaming modes (160 / 320 / 640 ms")
-        P("of look-ahead) — these files run the full-context mode.\n")
+        P("of look-ahead) — these files run the full-context mode." + q4_note("en") + "\n")
         P("## Performance\n")
         P("One recording a run, `cortiq transcribe --stats`, the second pass in one process (weights already on the device):")
         P("the time from samples to transcript — voice-activity cut, features, encoder, decoding — and the recording's")
@@ -317,7 +330,7 @@ def emit(lang):
         P("## Accuracy\n")
         P("Word error rate, %, of each file and of the reference implementation on the same clips with the same text")
         P("normalization; the last column counts the clips whose normalized transcript is the reference's exactly.")
-        P("CMF rows ran on CUDA at its default precision.\n")
+        P("The published files ran on CUDA at its default precision.\n")
         P("Formatted transcript (`e2e` head):\n")
         P(wer_table(lang, T, "e2e") + "\n")
         P("Plain words (`raw` head):\n")
@@ -372,7 +385,7 @@ def emit(lang):
         P("каналов любые: звук сводится в моно 16 кГц. Таблица файлов с WER — в разделе [Files](#files): RNN-T точнее и")
         P("стоит у авторов по умолчанию, CTC декодирует за один проход и быстрее. В каждом файле обе головы и сеть")
         P("голосовой активности. Не выложены ревизия `ssl` (энкодер без головы распознавания) и потоковые режимы")
-        P("(160 / 320 / 640 мс заглядывания вперёд): файлы работают в режиме полного контекста.\n")
+        P("(160 / 320 / 640 мс заглядывания вперёд): файлы работают в режиме полного контекста." + q4_note("ru") + "\n")
         P("### Скорость\n")
         P("Одна запись за прогон, `cortiq transcribe --stats`, второй проход в одном процессе (веса уже на устройстве):")
         P("время от отсчётов до транскрипта — нарезка по голосовой активности, признаки, энкодер, декодирование — и длина")
@@ -422,7 +435,7 @@ def emit(lang):
         P("Доля ошибок по словам, %, у каждого файла и у эталонной реализации на тех же клипах с той же нормализацией")
         P("текста (нижний регистр, ё → е, без пунктуации; числа, которые модель пишет цифрами, считаются ошибкой против")
         P("разметки прописью — одинаково для всех строк). Последний столбец — клипы, чей нормализованный транскрипт")
-        P("совпал с эталоном полностью. Строки CMF сняты на CUDA с точностью по умолчанию.\n")
+        P("совпал с эталоном полностью. Выложенные файлы сняты на CUDA с точностью по умолчанию.\n")
         P("Оформленный транскрипт (голова `e2e`):\n")
         P(wer_table(lang, T, "e2e") + "\n")
         P("Простые слова (голова `raw`):\n")
@@ -465,7 +478,7 @@ def emit(lang):
         P("WAV 直接读取；mp3、flac、ogg、m4a 等在 PATH 中有 `ffmpeg` 时通过它解码。采样率和声道数不限：音频会混成 16 kHz 单声道。")
         P("带 WER 的文件表见 [Files](#files)：RNN-T 更准确，也是上游的默认版本；CTC 一遍解码，速度更快。每个文件都包含两个识别头")
         P("和语音活动检测网络。未提供的有：`ssl` 版本（没有识别头的编码器）和流式模式（160 / 320 / 640 毫秒前瞻）——这些文件以")
-        P("全上下文模式运行。\n")
+        P("全上下文模式运行。" + q4_note("zh") + "\n")
         P("### 性能\n")
         P("每次运行一段录音，`cortiq transcribe --stats`，同一进程内的第二遍（权重已在设备上）：从采样到转写的时间——语音活动")
         P("切分、特征、编码器、解码——以及录音长度与它之比。录音由测试集的片段首尾相接而成。显存为 `nvidia-smi` 显示的、高于")
@@ -511,7 +524,7 @@ def emit(lang):
         P("### 准确率\n")
         P("各文件与参考实现在相同片段上、使用相同文本规范化（小写、ё → е、去掉标点；模型写成数字的数，相对于用文字标注的")
         P("参考文本计为错误，对每一行都一样）得到的词错误率（%）。最后一列是规范化后的转写与参考实现完全一致的片段数。")
-        P("CMF 各行在 CUDA 上以默认精度测得。\n")
+        P("已发布的文件在 CUDA 上以默认精度测得。\n")
         P("规范文本（`e2e` 头）：\n")
         P(wer_table(lang, T, "e2e") + "\n")
         P("纯词（`raw` 头）：\n")
