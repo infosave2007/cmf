@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.21] — 2026-11-27
 
 ### Added
 - GigaAM-v4 (ai-sage/GigaAM-v4), speech recognition for Russian and English: `cortiq convert` packs the `rnnt`

@@ -700,7 +700,7 @@ cortiq transcribe nemotron-3.5-transcribe-30b-a4b-q4tp.cmf a.wav b.wav --stats
 `cortiq convert --model <каталог чекпоинта>` упаковывает чекпоинт NeMo
 (`--quant q8_2f | q4tp | q2tp`).
 
-### GigaAM-v4
+### GigaAM-v4 (0.9.21)
 
 `cortiq` целиком на Rust исполняет [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4) — модель распознавания
 речи для русского и английского (Zapformer-энкодер на 238 млн параметров с головами RNN-T или CTC: оформленный

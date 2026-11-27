@@ -713,7 +713,7 @@ expert keeps the most used ones and computes the rest on the CPU
 (`CMF_NEMO_EXPERT_GB` sets the budget). `cortiq convert --model <checkpoint dir>`
 packs the NeMo checkpoint (`--quant q8_2f | q4tp | q2tp`).
 
-### GigaAM-v4
+### GigaAM-v4 (0.9.21)
 
 `cortiq` runs [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4), a speech recognition model for Russian and
 English (a 238 M-parameter Zapformer encoder with RNN-T or CTC heads: a formatted transcript with case,

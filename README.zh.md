@@ -115,7 +115,7 @@ curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/jso
 思考型模型的推理放在 `reasoning_content` 中，回答放在 `content` 中；`"reasoning_format": "none"` 让推理以
 `<think>…</think>` 的形式留在 `content` 中。
 
-## GigaAM-v4：俄语和英语语音识别
+## GigaAM-v4：俄语和英语语音识别（0.9.21）
 
 `cortiq` 完全用 Rust 运行 [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4)——面向俄语和英语的语音识别模型
 （2.38 亿参数的 Zapformer 编码器，带 RNN-T 或 CTC 识别头：一份带大小写、标点和数字的规范转写，一份纯文本转写）：

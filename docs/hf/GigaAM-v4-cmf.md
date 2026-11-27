@@ -44,12 +44,12 @@ cuts long audio into segments of up to 30 s. Measured:
 ## Quick start
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf cortiq-cli
+cargo install cortiq-cli
 hf download infosave/GigaAM-v4-cmf GigaAM-v4-rnnt-q8_2f.cmf --local-dir .
 cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf speech.wav
 ```
 
-GigaAM support is in the source tree ([pull request 201](https://github.com/infosave2007/cmf/pull/201)) and ships with the release after 0.9.20; until the pull request is merged add `--branch gigaam-v4` to the install.
+Use cortiq 0.9.21 or later.
 
 Prebuilt binaries for Linux, macOS and Windows are on the [releases page](https://github.com/infosave2007/cmf/releases).
 Add `--features cuda` to the install for the CUDA backend (`CMF_GPU=cuda`). WAV is read directly; mp3, flac, ogg,
@@ -274,7 +274,7 @@ ML-фреймворков: GPU NVIDIA через CUDA или Vulkan, AMD и Inte
 Быстрый старт:
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf cortiq-cli
+cargo install cortiq-cli
 hf download infosave/GigaAM-v4-cmf GigaAM-v4-rnnt-q8_2f.cmf --local-dir .
 cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf speech.wav
 ```
@@ -468,7 +468,7 @@ Python 和任何机器学习框架，NVIDIA 显卡走 CUDA 或 Vulkan，AMD 和 
 快速开始：
 
 ```bash
-cargo install --git https://github.com/infosave2007/cmf cortiq-cli
+cargo install cortiq-cli
 hf download infosave/GigaAM-v4-cmf GigaAM-v4-rnnt-q8_2f.cmf --local-dir .
 cortiq transcribe GigaAM-v4-rnnt-q8_2f.cmf speech.wav
 ```

@@ -52,7 +52,7 @@ cortiq serve {FILE} --port 8080   # POST /v1/audio/transcriptions
 ```"""
 
 print("=== en ===")
-print(f"""### GigaAM-v4
+print(f"""### GigaAM-v4 (0.9.21)
 
 `cortiq` runs [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4), a speech recognition model for Russian and
 English (a 238 M-parameter Zapformer encoder with RNN-T or CTC heads: a formatted transcript with case,
@@ -72,7 +72,7 @@ reference's character for character. The server answers `POST /v1/audio/transcri
 --quant q8_2f | q4tp | f16` packs the `rnnt` or the `ctc` revision of the upstream repository.""")
 
 print("=== ru ===")
-print(f"""### GigaAM-v4
+print(f"""### GigaAM-v4 (0.9.21)
 
 `cortiq` целиком на Rust исполняет [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4) — модель распознавания
 речи для русского и английского (Zapformer-энкодер на 238 млн параметров с головами RNN-T или CTC: оформленный
@@ -92,7 +92,7 @@ CTC с временами слов и собственную сеть голос
 упаковывает ревизию `rnnt` или `ctc` исходного репозитория.""")
 
 print("=== zh ===")
-print(f"""## GigaAM-v4：俄语和英语语音识别
+print(f"""## GigaAM-v4：俄语和英语语音识别（0.9.21）
 
 `cortiq` 完全用 Rust 运行 [GigaAM-v4](https://huggingface.co/ai-sage/GigaAM-v4)——面向俄语和英语的语音识别模型
 （2.38 亿参数的 Zapformer 编码器，带 RNN-T 或 CTC 识别头：一份带大小写、标点和数字的规范转写，一份纯文本转写）：
